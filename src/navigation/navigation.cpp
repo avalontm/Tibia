@@ -1,4 +1,5 @@
 #include "navigation/navigation.hpp"
+#include "map/model.hpp"
 #include "resources/tibia_dat.hpp"
 
 #include <algorithm>
@@ -39,6 +40,15 @@ State6PathTargetUpdate update_observed_state6_path_target(
     globals.at_0x00605A09 = request.option_0x05A09;
     globals.at_0x00605A08 = request.option_0x05A08;
     return State6PathTargetUpdate::changed;
+}
+
+bool state6_path_target_is_near(State6PlayerPosition current,
+    State6PlayerPosition target) noexcept {
+    const auto delta_x = static_cast<std::int64_t>(target.x) - current.x;
+    const auto delta_y = static_cast<std::int64_t>(target.y) - current.y;
+    const auto distance = (delta_x < 0 ? -delta_x : delta_x) +
+        (delta_y < 0 ? -delta_y : delta_y);
+    return distance < 2;
 }
 
 std::optional<State6MovementDelta> state6_movement_delta(std::uint8_t direction) noexcept {
@@ -408,8 +418,10 @@ State6NativePathTileQuery query_observed_state6_path_tile(
             ty > std::numeric_limits<std::uint16_t>::max() ||
             tfloor > std::numeric_limits<std::uint8_t>::max()) return nullptr;
         const auto found = std::find_if(map.tiles.begin(), map.tiles.end(),
-            [=](const tibia::map::Tile& tile) {
-                return tile.x == tx && tile.y == ty && tile.floor == tfloor;
+            [&](const tibia::map::Tile& tile) {
+                const auto position = tibia::map::viewport_map_position(map, tile);
+                return position && position->x == tx && position->y == ty &&
+                    position->floor == tfloor;
             });
         return found == map.tiles.end() ? nullptr : &*found;
     };

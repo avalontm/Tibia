@@ -254,6 +254,7 @@ struct State6Container {
     std::uint8_t capacity{};
     bool has_parent{};
     std::vector<State6ContainerItem> items;
+    std::uint64_t revision{};
 };
 enum class State6ContainerChangeKind : std::uint8_t { add, update, remove };
 struct State6ContainerChange {

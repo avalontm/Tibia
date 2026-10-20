@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tibia::client {
@@ -17,9 +18,16 @@ enum class BattleTargetAction : std::uint16_t {
     follow = 0x2716,
     stop_follow = 0x2717,
     message_to = 0x2774,
+    invite_private = 0x2720,
+    exclude_private = 0x2721,
+    invite_party = 0x2722,
+    join_party = 0x2723,
+    revoke_party_invitation = 0x2725,
+    pass_party_leadership = 0x2726,
     add_vip = 0x271f,
     toggle_ignore = 0x2775,
-    copy_name = 0x27db
+    copy_name = 0x27db,
+    rule_violation = 0x2727
 };
 
 struct BattleTargetState {
@@ -39,6 +47,11 @@ struct BattleContextMenuOption {
     BattleTargetAction action{};
     std::wstring label;
 };
+
+[[nodiscard]] std::vector<BattleContextMenuOption> battle_party_context_options(
+    std::uint8_t local_party_flag,
+    std::uint8_t target_party_flag,
+    std::wstring_view player_name);
 
 struct BattleContextMenuPlan {
     ContentWindowRect window;
@@ -67,7 +80,8 @@ inline constexpr int battle_context_menu_separator_height = 8;
     int anchor_x,
     int anchor_y,
     int client_width,
-    int client_height);
+    int client_height,
+    bool include_rule_violation = false);
 
 [[nodiscard]] bool apply_battle_target_action(
     BattleTargetState& targets,

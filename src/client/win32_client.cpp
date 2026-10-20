@@ -13,6 +13,8 @@
 #include "client/console_chat_input.hpp"
 #include "client/console_context_menu.hpp"
 #include "client/message_dialog_layout.hpp"
+#include "client/move_item_dialog_layout.hpp"
+#include "client/move_item_dialog_state.hpp"
 #include "client/new_channel_dialog_layout.hpp"
 #include "client/client_communication_preferences.hpp"
 #include "client/hints_catalog.hpp"
@@ -28,6 +30,8 @@
 #include "client/graphics_options_page.hpp"
 #include "client/network_options_page.hpp"
 #include "client/game_world_snapshot.hpp"
+#include "client/game_movement_request.hpp"
+#include "client/game_interaction_mode.hpp"
 #include "client/quest_log_layout.hpp"
 #include "client/ui_scrollbar_layout.hpp"
 #include "client/report_violation_dialog.hpp"
@@ -40,6 +44,8 @@
 #include "client/inventory_item_visual.hpp"
 #include "client/inventory_panel_renderer.hpp"
 #include "client/container_panel_renderer.hpp"
+#include "client/container_item_interaction.hpp"
+#include "client/container_item_context_menu.hpp"
 #include "client/battle_panel_model.hpp"
 #include "client/battle_panel_interaction.hpp"
 #include "client/battle_panel_renderer.hpp"
@@ -51,10 +57,14 @@
 #include "client/skills_panel_scroll.hpp"
 #include "client/skills_panel_window_layout.hpp"
 #include "client/vip_panel_window_layout.hpp"
+#include "client/vip_contact_order.hpp"
 #include "client/vip_context_menu.hpp"
+#include "client/vip_add_dialog_layout.hpp"
+#include "client/vip_edit_dialog_layout.hpp"
 #include "client/skills_panel_header_layout.hpp"
 #include "client/skills_context_menu.hpp"
 #include "client/map_window_camera.hpp"
+#include "client/map_player_target.hpp"
 #include "client/map_window_creature_renderer.hpp"
 #include "client/map_window_effect_renderer.hpp"
 #include "client/map_window_lighting_renderer.hpp"
@@ -73,6 +83,8 @@
 #include "network/login_session.hpp"
 #include "network/packet_stream.hpp"
 #include "network/channel_request.hpp"
+#include "network/container_request.hpp"
+#include "network/item_action_request.hpp"
 #include "network/speech_request.hpp"
 #include "network/console_filter_request.hpp"
 #include "network/rule_violation_request.hpp"
@@ -81,6 +93,9 @@
 #include "network/status_line_state.hpp"
 #include "network/tcp_connection.hpp"
 #include "map/window_tile_cache.hpp"
+#include "map/map_position_at.hpp"
+#include "map/move_item_source_at.hpp"
+#include "map/use_target_at.hpp"
 
 #include <cstdint>
 #include <algorithm>
@@ -94,6 +109,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -205,6 +221,8 @@ struct ClientHost {
     std::shared_ptr<LoginMailbox> login_mailbox{std::make_shared<LoginMailbox>()};
     std::shared_ptr<tibia::client::GameWorldSnapshotMailbox> game_world_mailbox{
         std::make_shared<tibia::client::GameWorldSnapshotMailbox>()};
+    tibia::client::GameMovementInputState game_movement_input_state;
+    std::mutex game_movement_input_mutex;
     std::shared_ptr<tibia::client::CommunicationSessionMailbox>
         communication_session_mailbox{
             std::make_shared<tibia::client::CommunicationSessionMailbox>()};
@@ -222,6 +240,8 @@ struct ClientHost {
     tibia::client::InventoryPanelRenderer inventory_panel_renderer;
     tibia::client::ContainerPanelRenderer container_panel_renderer;
     std::vector<tibia::client::ContainerPanelState> container_panel_states;
+    int container_panel_group_origin_y{-1};
+    int container_panel_available_height{-1};
     int pressed_container_header_id{-1};
     int pressed_container_header_button{-1};
     int moving_container_id{-1};
@@ -231,6 +251,28 @@ struct ClientHost {
     int resizing_container_id{-1};
     int container_resize_start_y{};
     int container_resize_start_height{};
+    int pressed_container_scroll_id{-1};
+    int pressed_container_scroll_part{-1};
+    bool container_scrollbar_dragging{};
+    int container_scrollbar_grab_offset{};
+    std::optional<tibia::client::ContainerItemContextMenuPlan>
+        container_item_context_menu;
+    tibia::client::ContainerItemHit container_item_context_hit;
+    std::optional<tibia::network::ItemPosition> container_item_context_position;
+    bool container_item_context_from_inventory{};
+    int pressed_container_item_context_action{-1};
+    std::optional<tibia::network::ItemPosition> pending_use_with_source;
+    std::optional<tibia::network::ItemPosition> pending_trade_source;
+    std::optional<tibia::network::ItemPosition> pending_move_item_source;
+    std::uint8_t pending_move_item_count{1};
+    POINT move_item_press_point{};
+    bool move_item_dragging{};
+    std::optional<tibia::client::MoveItemDialogState> move_item_dialog;
+    int pressed_move_item_button{-1};
+    int pressed_move_item_control{-1};
+    bool move_item_control_dragging{};
+    int move_item_thumb_grab_offset{};
+    POINT move_item_dialog_offset{};
     std::vector<tibia::client::RestoredContentWindow> restored_content_windows;
     tibia::client::BattlePanelModel battle_panel_model;
     std::vector<tibia::client::BattleCreatureRow> battle_panel_rows;
@@ -264,9 +306,33 @@ struct ClientHost {
     bool vip_scrollbar_dragging{};
     int vip_scrollbar_grab_offset{};
     int pressed_vip_header_button{-1};
+    std::array<std::int32_t, 3> vip_sort_methods{};
+    std::vector<tibia::client::BuddyPreference> vip_buddy_preferences;
+    bool vip_hide_offline{};
     std::optional<tibia::client::VipContextMenuPlan> vip_context_menu;
     int pressed_vip_context_menu_action{-1};
     std::wstring vip_context_player_name;
+    std::uint32_t vip_context_player_id{};
+    bool vip_add_dialog_open{};
+    std::wstring vip_add_name;
+    bool vip_add_name_focused{};
+    int pressed_vip_add_button{-1};
+    POINT vip_add_dialog_offset{};
+    bool vip_edit_dialog_open{};
+    std::uint32_t vip_edit_contact_id{};
+    std::wstring vip_edit_player_name;
+    std::wstring vip_edit_description;
+    int vip_edit_type{};
+    bool vip_edit_notify{};
+    bool vip_edit_description_focused{};
+    int vip_edit_description_scroll{};
+    int pressed_vip_edit_scroll_part{-1};
+    bool vip_edit_scrollbar_dragging{};
+    int vip_edit_scrollbar_grab_offset{};
+    int pressed_vip_edit_button{-1};
+    int pressed_vip_edit_type{-1};
+    bool pressed_vip_edit_notify{};
+    POINT vip_edit_dialog_offset{};
     tibia::client::SkillsPanelBarVisibility skills_bar_visibility;
     int skills_scroll_value{};
     int pressed_skills_scrollbar_part{-1};
@@ -405,6 +471,8 @@ struct ClientHost {
     int selected_character{-1};
     int character_list_scroll{};
     int pressed_character_scroll_button{-1};
+    bool character_scrollbar_dragging{};
+    int character_scrollbar_grab_offset{};
     POINT character_selection_dialog_offset{};
     std::uint16_t account_status{};
     UiScreen screen{UiScreen::main_menu};
@@ -490,7 +558,7 @@ struct ClientHost {
     std::int32_t console_height{};
     bool console_resize_dragging{};
     bool dragging{};
-    enum class DraggedDialog { none, login, character_selection, options, info, help, hints, hint_content, quest_log, quest_line, console_options, hotkey_options, general_options, network_options, graphics_options, advanced_graphics_options, notice, motd, account_data_warning, report_rule_violation, rule_violation_request, new_channel } dragged_dialog{DraggedDialog::none};
+    enum class DraggedDialog { none, login, character_selection, options, info, help, hints, hint_content, quest_log, quest_line, console_options, hotkey_options, general_options, network_options, graphics_options, advanced_graphics_options, notice, motd, account_data_warning, report_rule_violation, rule_violation_request, new_channel, vip_add, vip_edit, move_item } dragged_dialog{DraggedDialog::none};
     POINT login_dialog_offset{};
     POINT options_dialog_offset{};
     POINT info_dialog_offset{};
@@ -532,7 +600,7 @@ struct ClientHost {
     std::size_t selected_hotkey{};
     std::size_t hotkey_list_scroll{};
     std::optional<std::size_t> pending_hotkey_object_selection;
-    std::uint8_t interaction_mode{};
+    tibia::client::GameInteractionMode interaction_mode{};
     std::wstring hotkey_text;
     bool hotkey_send_automatically{};
     bool hotkey_text_focused{};
@@ -572,7 +640,10 @@ struct ClientHost {
 
 enum class ActiveDialog {
     connection_status,
+    move_item,
     none,
+    vip_add,
+    vip_edit,
     motd,
     account_data_warning,
     new_channel,
@@ -596,7 +667,10 @@ enum class ActiveDialog {
 
 ActiveDialog active_dialog(const ClientHost& host) {
     if (!host.connection_status_text.empty()) return ActiveDialog::connection_status;
+    if (host.move_item_dialog) return ActiveDialog::move_item;
     if (!host.notice_text.empty()) return ActiveDialog::notice;
+    if (host.vip_add_dialog_open) return ActiveDialog::vip_add;
+    if (host.vip_edit_dialog_open) return ActiveDialog::vip_edit;
     if (host.motd_open) return ActiveDialog::motd;
     if (host.account_data_warning_open) return ActiveDialog::account_data_warning;
     if (host.new_channel_dialog_open) return ActiveDialog::new_channel;
@@ -1572,21 +1646,16 @@ bool begin_options_list_scrollbar_interaction(ClientHost& host,
     const RECT up = options_list_scrollbar_part_rect(list, geometry.up_arrow);
     const RECT down = options_list_scrollbar_part_rect(list, geometry.down_arrow);
     const RECT track = options_list_scrollbar_part_rect(list, geometry.track);
-    const int count = static_cast<int>(options_list_item_count(host, target));
-    const int visible = options_list_visible_items(host, target);
-    int first = options_list_first_visible(host, target);
 
     host.list_scrollbar_target = target;
     host.pressed_list_scrollbar_part = -1;
     host.list_scrollbar_dragging = false;
     if (contains_point(up, mouse)) {
         host.pressed_list_scrollbar_part = 0;
-        set_options_list_first_visible(host, target, first - 1);
         return true;
     }
     if (contains_point(down, mouse)) {
         host.pressed_list_scrollbar_part = 1;
-        set_options_list_first_visible(host, target, first + 1);
         return true;
     }
     if (!geometry.thumb_visible) return contains_point(track, mouse);
@@ -1599,10 +1668,6 @@ bool begin_options_list_scrollbar_interaction(ClientHost& host,
     }
     if (contains_point(track, mouse)) {
         host.pressed_list_scrollbar_part = 2;
-        const int local_y = mouse.y - list.top;
-        set_options_list_first_visible(host, target,
-            tibia::client::ui_scrollbar_scroll_after_track_click(local_y,
-                geometry, first, static_cast<std::size_t>(count), visible));
         return true;
     }
     host.list_scrollbar_target = ClientHost::ListScrollbarTarget::none;
@@ -1625,7 +1690,23 @@ void update_options_list_scrollbar_drag(ClientHost& host) {
     set_options_list_first_visible(host, target, first);
 }
 
-void finish_options_list_scrollbar_interaction(ClientHost& host) {
+void finish_options_list_scrollbar_interaction(ClientHost& host,
+    POINT mouse, bool commit) {
+    const auto target = host.list_scrollbar_target;
+    const int part = host.pressed_list_scrollbar_part;
+    if (commit && !host.list_scrollbar_dragging &&
+        target != ClientHost::ListScrollbarTarget::none && part >= 0) {
+        const auto list = options_list_rect(host, target);
+        const int count = static_cast<int>(options_list_item_count(host, target));
+        const int visible = options_list_visible_items(host, target);
+        const int first = options_list_first_visible(host, target);
+        const auto geometry = options_list_scrollbar_geometry(host.window, list,
+            static_cast<std::size_t>(count), visible, first);
+        set_options_list_first_visible(host, target,
+            tibia::client::ui_scrollbar_scroll_after_release(
+                mouse.x - list.left, mouse.y - list.top, part, geometry, first,
+                static_cast<std::size_t>(count), visible));
+    }
     host.list_scrollbar_target = ClientHost::ListScrollbarTarget::none;
     host.pressed_list_scrollbar_part = -1;
     host.list_scrollbar_dragging = false;
@@ -2779,20 +2860,18 @@ void draw_primary_console_transcript(ClientHost& host,
 void draw_game_status_message(ClientHost& host,
     const tibia::client::GameWorldSnapshot& snapshot,
     const tibia::client::MapWindowLayout& map) {
-    if (!snapshot.status_visible || snapshot.status_text.empty()) return;
+    if (!snapshot.status_visible || snapshot.status_text.empty())
+        return;
     constexpr std::size_t font_index = 2;
     const int line_spacing = std::max(1, host.ui_font_heights[font_index]);
     const int line_height = line_spacing;
     const auto text = decode_ui_string(snapshot.status_text);
-    const auto lines = wrap_bitmap_lines(host, text, map.width, font_index, false);
-    if (lines.empty()) return;
-    const int visible_lines = std::min(static_cast<int>(lines.size()),
-        std::max(1, map.height / line_height));
-    const int text_height = visible_lines * line_height;
-    const int top = map.y + map.height - text_height;
-    for (int index = 0; index < visible_lines; ++index)
-        draw_bitmap_text(host, lines[static_cast<std::size_t>(index)], map.x,
-            top + index * line_height, map.width, true, font_index, 255, false);
+    if (text.empty()) return;
+    const int text_width = bitmap_text_width(host, text, font_index, host.window);
+    const int text_x = map.x + (map.width - text_width) / 2;
+    const int text_y = map.y + map.height - line_height;
+    const RECT clip{map.x, map.y, map.x + map.width, map.y + map.height};
+    draw_bitmap_text_clipped(host, text, text_x, text_y, clip, font_index, 255);
 }
 
 tibia::resources::TibiaSprImage crop_picture(const std::vector<std::uint8_t>& bytes,
@@ -3625,10 +3704,20 @@ void draw_skills_content_window(ClientHost& host,
             scrollbar.thumb.y + scrollbar.thumb.height - cap,
             scrollbar.thumb.width, cap);
     }
-    draw_skin(host, host.pressed_skills_scrollbar_part == 0 ? 158 : 157,
+    const RECT up_arrow{scrollbar.up_arrow.x, scrollbar.up_arrow.y,
+        scrollbar.up_arrow.x + scrollbar.up_arrow.width,
+        scrollbar.up_arrow.y + scrollbar.up_arrow.height};
+    const RECT down_arrow{scrollbar.down_arrow.x, scrollbar.down_arrow.y,
+        scrollbar.down_arrow.x + scrollbar.down_arrow.width,
+        scrollbar.down_arrow.y + scrollbar.down_arrow.height};
+    const bool up_pressed = host.pressed_skills_scrollbar_part == 0 &&
+        (host.mouse_buttons & 1U) != 0 && contains_point(up_arrow, host.mouse);
+    const bool down_pressed = host.pressed_skills_scrollbar_part == 1 &&
+        (host.mouse_buttons & 1U) != 0 && contains_point(down_arrow, host.mouse);
+    draw_skin(host, up_pressed ? 158 : 157,
         scrollbar.up_arrow.x, scrollbar.up_arrow.y,
         scrollbar.up_arrow.width, scrollbar.up_arrow.height);
-    draw_skin(host, host.pressed_skills_scrollbar_part == 1 ? 160 : 159,
+    draw_skin(host, down_pressed ? 160 : 159,
         scrollbar.down_arrow.x, scrollbar.down_arrow.y,
         scrollbar.down_arrow.width, scrollbar.down_arrow.height);
     if (window.height > tibia::client::content_window_frame_header_height)
@@ -3645,24 +3734,8 @@ std::optional<tibia::client::VipPanelWindowPlan> vip_panel_window_plan(
     ClientHost& host, HWND window);
 int content_window_origin_y(int automap_y);
 
-std::vector<tibia::client::ContainerPanelLayout> container_panel_layouts(
-    ClientHost& host, HWND window,
-    const tibia::client::GameWorldSnapshot& snapshot,
+int container_panel_group_available_height(ClientHost& host, HWND window,
     const tibia::client::GameWindowLayout& game_layout) {
-    host.container_panel_states.erase(std::remove_if(
-        host.container_panel_states.begin(), host.container_panel_states.end(),
-        [&snapshot](const auto& state) {
-            return std::none_of(snapshot.containers.begin(), snapshot.containers.end(),
-                [&state](const auto& container) { return container.id == state.id; });
-        }), host.container_panel_states.end());
-    for (const auto& container : snapshot.containers) {
-        if (std::none_of(host.container_panel_states.begin(),
-                host.container_panel_states.end(), [&container](const auto& state) {
-                    return state.id == container.id;
-                }))
-            host.container_panel_states.push_back({container.id, 0, 0, 0, -1,
-                ++host.next_container_z_order, false});
-    }
     const int automap_y = host.inventory_minimized
         ? tibia::client::automap_panel_minimized_inventory_y
         : tibia::client::automap_panel_full_inventory_y;
@@ -3673,6 +3746,79 @@ std::vector<tibia::client::ContainerPanelLayout> container_panel_layouts(
         origin_y = std::max(origin_y, plan->window.y + plan->window.height);
     if (const auto plan = vip_panel_window_plan(host, window))
         origin_y = std::max(origin_y, plan->window.y + plan->window.height);
+    return std::max(0, game_layout.sidebar.y + game_layout.sidebar.height - origin_y);
+}
+
+std::vector<tibia::client::ContainerPanelLayout> container_panel_layouts(
+    ClientHost& host, HWND window,
+    const tibia::client::GameWorldSnapshot& snapshot,
+    const tibia::client::GameWindowLayout& game_layout) {
+    const auto previous_state_count = host.container_panel_states.size();
+    host.container_panel_states.erase(std::remove_if(
+        host.container_panel_states.begin(), host.container_panel_states.end(),
+        [&snapshot](const auto& state) {
+            return std::none_of(snapshot.containers.begin(), snapshot.containers.end(),
+                [&state](const auto& container) { return container.id == state.id; });
+        }), host.container_panel_states.end());
+    const bool container_closed =
+        host.container_panel_states.size() != previous_state_count;
+    std::vector<std::uint8_t> newly_opened;
+    for (const auto& container : snapshot.containers) {
+        if (std::none_of(host.container_panel_states.begin(),
+                host.container_panel_states.end(), [&container](const auto& state) {
+                    return state.id == container.id;
+                }))
+        {
+            tibia::client::ContainerPanelState state;
+            state.id = container.id;
+            state.observed_container_revision = container.revision;
+            state.z_order = ++host.next_container_z_order;
+            const auto content_rows = std::max(1, static_cast<int>(
+                (container.capacity + tibia::client::container_column_count - 1) /
+                    tibia::client::container_column_count));
+            const auto rows = std::min(tibia::client::container_visible_row_count,
+                content_rows);
+            state.height = tibia::client::content_window_frame_top_height +
+                rows * tibia::client::container_item_step +
+                tibia::client::content_window_frame_bottom_height;
+            state.restore_height = state.height;
+            host.container_panel_states.insert(
+                host.container_panel_states.begin(), state);
+            newly_opened.insert(newly_opened.begin(), container.id);
+        }
+        const auto state = std::find_if(host.container_panel_states.begin(),
+            host.container_panel_states.end(), [&container](const auto& current) {
+                return current.id == container.id;
+            });
+        if (state != host.container_panel_states.end() &&
+            state->observed_container_revision != container.revision) {
+            state->observed_container_revision = container.revision;
+            state->higher_navigation_pending = false;
+        }
+    }
+    const auto origin_y = game_layout.sidebar.y + game_layout.sidebar.height -
+        container_panel_group_available_height(host, window, game_layout);
+    const auto available_height = container_panel_group_available_height(
+        host, window, game_layout);
+    if (host.container_panel_group_origin_y != origin_y ||
+        host.container_panel_available_height != available_height) {
+        for (auto& state : host.container_panel_states) state.position_y = -1;
+        host.container_panel_group_origin_y = origin_y;
+        host.container_panel_available_height = available_height;
+    }
+    if (container_closed)
+        tibia::client::fit_container_panel_group_after_close(
+            host.container_panel_states, snapshot.containers, available_height);
+    for (const auto id : newly_opened)
+        tibia::client::fit_container_panel_group_for_open(
+            host.container_panel_states, id,
+            std::find_if(host.container_panel_states.begin(),
+                host.container_panel_states.end(), [id](const auto& state) {
+                    return state.id == id;
+                })->height,
+            available_height);
+    tibia::client::fit_container_panel_group_to_available_height(
+        host.container_panel_states, available_height);
     const tibia::client::ContentWindowRect sidebar{
         game_layout.sidebar.x, game_layout.sidebar.y,
         game_layout.sidebar.width, game_layout.sidebar.height};
@@ -3684,8 +3830,21 @@ std::vector<tibia::client::ContainerPanelLayout> container_panel_layouts(
                 return current.id == panel.id;
             });
         if (state != host.container_panel_states.end()) {
-            if (state->position_y < 0) state->position_y = panel.window.y;
             state->scroll_value = panel.scroll_value;
+            if (state->minimized) {
+                state->height = tibia::client::container_panel_minimized_height;
+            } else if (state->height <= 0) {
+                state->height = panel.window.height;
+            } else {
+                state->height = std::max(state->height,
+                    tibia::client::container_panel_minimum_height);
+            }
+            if (state->restore_height <= 0) {
+                state->restore_height = panel.window.height;
+            } else {
+                state->restore_height = std::max(state->restore_height,
+                    tibia::client::container_panel_minimum_height);
+            }
         }
     }
     std::sort(panels.begin(), panels.end(), [&host](const auto& left, const auto& right) {
@@ -3703,6 +3862,742 @@ std::vector<tibia::client::ContainerPanelLayout> container_panel_layouts(
         return left_state->z_order < right_state->z_order;
     });
     return panels;
+}
+
+bool open_container_item_context_menu(ClientHost& host, HWND window,
+    const tibia::client::ContainerItemHit& hit, POINT anchor) {
+    if (!host.dat || !host.game_world_mailbox) return false;
+    const auto* object = host.dat->find_item(hit.item_type);
+    if (!object) return false;
+    const auto snapshot = host.game_world_mailbox->read();
+    if (!snapshot) return false;
+    const bool parent_container_open = std::any_of(
+        snapshot->containers.begin(), snapshot->containers.end(),
+        [&hit](const auto& container) { return container.id == hit.container_id; });
+    auto options = tibia::client::container_item_context_menu_options(
+        object->has_native_property(4), object->has_native_property(7),
+        object->has_native_property(0x15), true, parent_container_open,
+        object->has_native_property(0x11) && !object->has_native_property(0x0e));
+    std::vector<int> widths;
+    widths.reserve(options.size());
+    for (const auto& option : options)
+        widths.push_back(bitmap_text_width(host, option.second, 1, window));
+    RECT client{};
+    if (!GetClientRect(window, &client)) return false;
+    host.battle_context_menu.reset();
+    host.vip_context_menu.reset();
+    host.skills_context_menu.reset();
+    host.console_context_menu.reset();
+    host.pressed_container_item_context_action = -1;
+    host.container_item_context_hit = hit;
+    host.container_item_context_position = tibia::network::ItemPosition{
+        0xffff, static_cast<std::uint16_t>(hit.container_id + 0x40U),
+        hit.slot, hit.item_type, hit.slot};
+    host.container_item_context_from_inventory = false;
+    host.container_item_context_menu =
+        tibia::client::make_container_item_context_menu_plan(
+            std::move(options), widths,
+            std::max(1, host.ui_font_heights[1]), anchor.x, anchor.y,
+            client.right - client.left, client.bottom - client.top);
+    InvalidateRect(window, nullptr, FALSE);
+    return true;
+}
+
+bool open_inventory_item_context_menu(ClientHost& host, HWND window,
+    std::uint8_t slot, std::uint16_t item_type, POINT anchor) {
+    if (!host.dat || !host.game_world_mailbox) return false;
+    const auto* object = host.dat->find_item(item_type);
+    if (!object) return false;
+    std::vector<std::pair<tibia::client::ContainerItemContextAction, std::wstring>> options;
+    options.emplace_back(tibia::client::ContainerItemContextAction::look, L"Look");
+    if (object->has_native_property(4)) {
+        options.emplace_back(
+            tibia::client::ContainerItemContextAction::open_in_new_window, L"Open");
+    } else if (object->has_native_property(7)) {
+        options.emplace_back(
+            tibia::client::ContainerItemContextAction::use_with, L"Use with ...");
+    } else {
+        options.emplace_back(tibia::client::ContainerItemContextAction::use, L"Use");
+    }
+    if (object->has_native_property(0x15))
+        options.emplace_back(tibia::client::ContainerItemContextAction::rotate, L"Rotate");
+    if (object->has_native_property(0x11) && !object->has_native_property(0x0e))
+        options.emplace_back(
+            tibia::client::ContainerItemContextAction::trade_with, L"Trade with ...");
+    std::vector<int> widths;
+    widths.reserve(options.size());
+    for (const auto& option : options)
+        widths.push_back(bitmap_text_width(host, option.second, 1, window));
+    RECT client{};
+    if (!GetClientRect(window, &client)) return false;
+    host.battle_context_menu.reset();
+    host.vip_context_menu.reset();
+    host.skills_context_menu.reset();
+    host.console_context_menu.reset();
+    host.pressed_container_item_context_action = -1;
+    host.container_item_context_hit = {0xff, slot, item_type, 0, false};
+    host.container_item_context_position = tibia::network::ItemPosition{
+        0xffff, slot, 0, item_type, 0};
+    host.container_item_context_from_inventory = true;
+    host.container_item_context_menu =
+        tibia::client::make_container_item_context_menu_plan(
+            std::move(options), widths,
+            std::max(1, host.ui_font_heights[1]), anchor.x, anchor.y,
+            client.right - client.left, client.bottom - client.top);
+    InvalidateRect(window, nullptr, FALSE);
+    return true;
+}
+
+bool apply_container_item_context_action(ClientHost& host, HWND window,
+    tibia::client::ContainerItemContextAction action,
+    const tibia::client::ContainerItemHit& hit) {
+    if (!host.send_game_payload || !host.game_world_mailbox) return false;
+    const auto snapshot = host.game_world_mailbox->read();
+    if (!snapshot) return false;
+    try {
+        if (action == tibia::client::ContainerItemContextAction::use_with) {
+            if (!host.container_item_context_position) return false;
+            host.pending_use_with_source = *host.container_item_context_position;
+            host.interaction_mode = tibia::client::interaction_mode_for_event(
+                tibia::client::NativeInteractionEvent::use_with_target);
+            InvalidateRect(window, nullptr, FALSE);
+            return true;
+        }
+        if (action == tibia::client::ContainerItemContextAction::trade_with) {
+            if (!host.container_item_context_position) return false;
+            host.pending_trade_source = *host.container_item_context_position;
+            host.interaction_mode = tibia::client::interaction_mode_for_event(
+                tibia::client::NativeInteractionEvent::trade_with_player);
+            InvalidateRect(window, nullptr, FALSE);
+            return true;
+        }
+        if (host.container_item_context_from_inventory) {
+            if (!host.container_item_context_position) return false;
+            const auto& position = *host.container_item_context_position;
+            if (action == tibia::client::ContainerItemContextAction::look) {
+                host.send_game_payload(
+                    tibia::network::encode_look_item_request(position));
+                return true;
+            }
+            if (action == tibia::client::ContainerItemContextAction::rotate) {
+                host.send_game_payload(
+                    tibia::network::encode_rotate_item_request(position));
+                return true;
+            }
+            if (action == tibia::client::ContainerItemContextAction::use) {
+                host.send_game_payload(
+                    tibia::network::encode_use_item_request(position));
+                return true;
+            }
+            if (action == tibia::client::ContainerItemContextAction::open_in_new_window) {
+                std::array<bool, 16> occupied{};
+                for (const auto& container : snapshot->containers)
+                    occupied[container.id] = true;
+                const auto free_slot = std::find(occupied.begin(), occupied.end(), false);
+                const auto destination = free_slot == occupied.end()
+                    ? static_cast<std::uint8_t>(15)
+                    : static_cast<std::uint8_t>(free_slot - occupied.begin());
+                host.send_game_payload(
+                    tibia::network::encode_use_item_request(position, destination));
+                return true;
+            }
+            return false;
+        }
+        if (action == tibia::client::ContainerItemContextAction::move_up) {
+            const auto* object = host.dat ? host.dat->find_item(hit.item_type) : nullptr;
+            const auto amount = object && object->has_native_property(5)
+                ? hit.extra : 1;
+            const auto payload = tibia::network::encode_container_move_up_request(
+                hit.container_id, hit.slot, hit.item_type, amount);
+            host.send_game_payload(payload);
+            return true;
+        }
+        if (action == tibia::client::ContainerItemContextAction::rotate) {
+            const auto payload = tibia::network::encode_rotate_item_request(
+                *host.container_item_context_position);
+            host.send_game_payload(payload);
+            return true;
+        }
+        if (action == tibia::client::ContainerItemContextAction::look) {
+            const auto payload = tibia::network::encode_look_item_request(
+                *host.container_item_context_position);
+            host.send_game_payload(payload);
+            return true;
+        }
+        if (action == tibia::client::ContainerItemContextAction::use ||
+            action == tibia::client::ContainerItemContextAction::open ||
+            action == tibia::client::ContainerItemContextAction::open_in_new_window) {
+            auto action_parameter = static_cast<std::uint8_t>(0);
+            if (action == tibia::client::ContainerItemContextAction::open)
+                action_parameter = hit.container_id;
+            if (action == tibia::client::ContainerItemContextAction::open_in_new_window) {
+                std::array<bool, 16> occupied{};
+                for (const auto& container : snapshot->containers)
+                    occupied[container.id] = true;
+                const auto free_slot = std::find(occupied.begin(), occupied.end(), false);
+                action_parameter = free_slot == occupied.end()
+                    ? 15
+                    : static_cast<std::uint8_t>(free_slot - occupied.begin());
+            }
+            const auto payload = tibia::network::encode_use_item_request(
+                *host.container_item_context_position, action_parameter);
+            host.send_game_payload(payload);
+            return true;
+        }
+    } catch (const std::exception& error) {
+        host.notice_text = error_to_wide(error.what());
+        InvalidateRect(window, nullptr, FALSE);
+    }
+    return false;
+}
+
+bool send_use_with_item_pair(ClientHost& host, HWND window,
+    const tibia::network::ItemPosition& source,
+    const tibia::network::ItemPosition& target) {
+    if (!host.send_game_payload) return false;
+    try {
+        const auto payload = tibia::network::encode_use_with_item_request(
+            source, target);
+        host.send_game_payload(payload);
+    } catch (const std::exception& error) {
+        host.notice_text = error_to_wide(error.what());
+        InvalidateRect(window, nullptr, FALSE);
+        return false;
+    }
+    host.pending_use_with_source.reset();
+    host.interaction_mode = tibia::client::GameInteractionMode::none;
+    InvalidateRect(window, nullptr, FALSE);
+    return true;
+}
+
+bool send_use_with_body_slot(ClientHost& host, HWND window, POINT click) {
+    if (!host.pending_use_with_source || !host.game_world_mailbox ||
+        host.inventory_minimized)
+        return false;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return false;
+    const auto layout = tibia::client::resolve_game_window_layout({
+        client.right - client.left, client.bottom - client.top,
+        host.console_height, tibia::client::map_panel_height,
+        tibia::client::map_window_minimum_height, host.no_stretching});
+    if (!layout) return false;
+    const auto slot = tibia::client::inventory_slot_at(
+        layout->sidebar.x + tibia::client::inventory_panel_offset_x,
+        tibia::client::inventory_panel_offset_y, click.x, click.y);
+    if (!slot) return false;
+    const auto snapshot = host.game_world_mailbox->read();
+    if (!snapshot) return false;
+    const auto target = std::find_if(snapshot->inventory.begin(),
+        snapshot->inventory.end(), [slot](const auto& entry) {
+            return entry.slot == *slot;
+        });
+    if (target == snapshot->inventory.end() || target->item.type == 0)
+        return false;
+    const auto& source_position = *host.pending_use_with_source;
+    const tibia::network::ItemPosition target_position{
+        0xffff, *slot, 0, target->item.type, 0};
+    return send_use_with_item_pair(host, window, source_position, target_position);
+}
+
+bool send_use_with_container_item(ClientHost& host, HWND window, POINT click) {
+    if (!host.pending_use_with_source || !host.game_world_mailbox) return false;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return false;
+    const auto snapshot = host.game_world_mailbox->read();
+    const auto layout = tibia::client::resolve_game_window_layout({
+        client.right - client.left, client.bottom - client.top,
+        host.console_height, tibia::client::map_panel_height,
+        tibia::client::map_window_minimum_height, host.no_stretching});
+    if (!snapshot || !layout) return false;
+    const auto panels = container_panel_layouts(host, window, *snapshot, *layout);
+    const auto target = tibia::client::container_item_at(
+        panels, snapshot->containers, click.x, click.y);
+    if (!target) return false;
+    const auto& source_position = *host.pending_use_with_source;
+    const auto target_y = static_cast<std::uint16_t>(target->container_id + 0x40U);
+    const tibia::network::ItemPosition target_position{
+        0xffff, target_y, target->slot, target->item_type, target->slot};
+    return send_use_with_item_pair(host, window, source_position, target_position);
+}
+
+bool send_use_with_map_target(ClientHost& host, HWND window, POINT click) {
+    if (!host.pending_use_with_source || !host.game_world_mailbox || !host.dat ||
+        !host.send_game_payload)
+        return false;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return false;
+    const auto snapshot = host.game_world_mailbox->read();
+    const auto layout = tibia::client::resolve_game_window_layout({
+        client.right - client.left, client.bottom - client.top,
+        host.console_height, tibia::client::map_panel_height,
+        tibia::client::map_window_minimum_height, host.no_stretching});
+    if (!snapshot || !snapshot->map || !snapshot->render_filter_grid || !layout)
+        return false;
+    const auto camera = tibia::client::resolve_map_window_camera_offset(*snapshot);
+    if (!camera) return false;
+    const auto target = tibia::map::use_target_at(*snapshot, *host.dat,
+        layout->map, *camera, host.no_stretching, click.x, click.y);
+    if (!target) return false;
+
+    const auto& source_position = *host.pending_use_with_source;
+    if (target->object->type == 0x63 &&
+        target->object->creature_id >= 0x400U) {
+        try {
+            const auto payload = tibia::network::encode_use_item_on_creature_request(
+                source_position, target->object->creature_id);
+            host.send_game_payload(payload);
+        } catch (const std::exception& error) {
+            host.notice_text = error_to_wide(error.what());
+            InvalidateRect(window, nullptr, FALSE);
+            return false;
+        }
+        host.pending_use_with_source.reset();
+        host.interaction_mode = tibia::client::GameInteractionMode::none;
+        InvalidateRect(window, nullptr, FALSE);
+        return true;
+    }
+    if (target->stack_position > std::numeric_limits<std::uint8_t>::max()) return false;
+    const tibia::network::ItemPosition target_position{
+        target->tile->x, target->tile->y, target->tile->floor,
+        target->object->type, static_cast<std::uint8_t>(target->stack_position)};
+    return send_use_with_item_pair(host, window, source_position, target_position);
+}
+
+bool send_use_with_creature(ClientHost& host, HWND window,
+    std::uint32_t creature_id) {
+    if (!host.pending_use_with_source || !host.send_game_payload ||
+        creature_id == 0)
+        return false;
+    const auto& source_position = *host.pending_use_with_source;
+    try {
+        const auto payload = tibia::network::encode_use_item_on_creature_request(
+            source_position, creature_id);
+        host.send_game_payload(payload);
+    } catch (const std::exception& error) {
+        host.notice_text = error_to_wide(error.what());
+        InvalidateRect(window, nullptr, FALSE);
+        return false;
+    }
+    host.pending_use_with_source.reset();
+    host.interaction_mode = tibia::client::GameInteractionMode::none;
+    InvalidateRect(window, nullptr, FALSE);
+    return true;
+}
+
+bool send_trade_with_map_target(ClientHost& host, HWND window, POINT click) {
+    if (!host.pending_trade_source || !host.dat || !host.game_world_mailbox ||
+        !host.send_game_payload)
+        return false;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return false;
+    const auto snapshot = host.game_world_mailbox->read();
+    const auto layout = tibia::client::resolve_game_window_layout({
+        client.right - client.left, client.bottom - client.top,
+        host.console_height, tibia::client::map_panel_height,
+        tibia::client::map_window_minimum_height, host.no_stretching});
+    if (!snapshot || !snapshot->map || !layout) return false;
+    const RECT map_rect{layout->map.x, layout->map.y,
+        layout->map.x + layout->map.width,
+        layout->map.y + layout->map.height};
+    if (click.x < map_rect.left || click.x >= map_rect.right ||
+        click.y < map_rect.top || click.y >= map_rect.bottom)
+        return false;
+    const auto camera = tibia::client::resolve_map_window_camera_offset(*snapshot);
+    if (!camera) {
+        if (host.communication_session_mailbox)
+            host.communication_session_mailbox->enqueue_status_message(
+                "Select a player to trade with.");
+        InvalidateRect(window, nullptr, FALSE);
+        return true;
+    }
+    const auto creature = tibia::client::map_creature_at(
+        *snapshot, *host.dat, layout->map, *camera, host.no_stretching,
+        click.x, click.y);
+    if (!creature || *creature == 0 ||
+        *creature == snapshot->map->local_player_id || *creature >= 0x400U) {
+        if (host.communication_session_mailbox)
+            host.communication_session_mailbox->enqueue_status_message(
+                "Select a player to trade with.");
+        InvalidateRect(window, nullptr, FALSE);
+        return true;
+    }
+    try {
+        const auto payload = tibia::network::encode_trade_with_creature_request(
+            *host.pending_trade_source, *creature);
+        host.send_game_payload(payload);
+    } catch (const std::exception& error) {
+        host.notice_text = error_to_wide(error.what());
+        InvalidateRect(window, nullptr, FALSE);
+        return true;
+    }
+    host.pending_trade_source.reset();
+    host.interaction_mode = tibia::client::GameInteractionMode::none;
+    InvalidateRect(window, nullptr, FALSE);
+    return true;
+}
+
+bool send_map_walk_request(ClientHost& host, HWND window, POINT click) {
+    if (!host.dat || !host.game_world_mailbox || !host.send_game_payload)
+        return false;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return false;
+    const auto layout = tibia::client::resolve_game_window_layout({
+        client.right - client.left, client.bottom - client.top,
+        host.console_height, tibia::client::map_panel_height,
+        tibia::client::map_window_minimum_height, host.no_stretching});
+    const auto snapshot = host.game_world_mailbox->read();
+    if (!layout || !snapshot || !snapshot->map) return false;
+    const RECT map_rect{layout->map.x, layout->map.y,
+        layout->map.x + layout->map.width,
+        layout->map.y + layout->map.height};
+    if (!contains_point(map_rect, click)) return false;
+
+    const auto panels = container_panel_layouts(host, window, *snapshot, *layout);
+    if (std::any_of(panels.begin(), panels.end(), [&click](const auto& panel) {
+            return contains_point(RECT{panel.window.x, panel.window.y,
+                panel.window.x + panel.window.width,
+                panel.window.y + panel.window.height}, click);
+        }))
+        return false;
+
+    const auto camera = tibia::client::resolve_map_window_camera_offset(*snapshot);
+    if (!camera) return false;
+    const auto destination = tibia::map::map_position_at(*snapshot, *host.dat,
+        layout->map, *camera, host.no_stretching, click.x, click.y);
+    if (!destination) return false;
+    const auto player = std::find_if(snapshot->creatures.begin(),
+        snapshot->creatures.end(), [&snapshot](const auto& creature) {
+            return creature.state.creature_id == snapshot->map->local_player_id;
+        });
+    if (player == snapshot->creatures.end()) return false;
+    const tibia::network::State6PlayerPosition current{
+        player->world_x, player->world_y, player->world_floor};
+    const auto path_grid = host.game_world_mailbox->path_search_grid(current);
+    if (!path_grid) return false;
+    std::optional<tibia::client::GameMovementRequest> request;
+    {
+        const std::lock_guard movement_lock(host.game_movement_input_mutex);
+        request = tibia::client::make_map_walk_request(*snapshot, *host.dat,
+            {destination->x, destination->y, destination->floor}, *path_grid,
+            host.game_movement_input_state);
+    }
+    if (!request) return false;
+    if (request->target_blocked) {
+        if (host.communication_session_mailbox)
+            host.communication_session_mailbox->enqueue_status_message(
+                "Sorry, not possible.");
+    } else if (!request->status_message.empty()) {
+        if (host.communication_session_mailbox)
+            host.communication_session_mailbox->enqueue_status_message(
+                request->status_message);
+    } else if (!request->payload.empty()) {
+        host.send_game_payload(request->payload);
+    }
+    return true;
+}
+
+bool send_container_item_action(ClientHost& host, HWND window, int x, int y) {
+    if (!host.dat || !host.send_game_payload || !host.game_world_mailbox)
+        return false;
+    RECT client{};
+    GetClientRect(window, &client);
+    const auto snapshot = host.game_world_mailbox->read();
+    const auto game_layout = tibia::client::resolve_game_window_layout({
+        client.right - client.left, client.bottom - client.top,
+        host.console_height, tibia::client::map_panel_height,
+        tibia::client::map_window_minimum_height, host.no_stretching});
+    if (!snapshot || !game_layout) return false;
+    const auto panels = container_panel_layouts(host, window, *snapshot, *game_layout);
+    const auto hit = tibia::client::container_item_at(
+        panels, snapshot->containers, x, y);
+    if (!hit)
+        return tibia::client::container_panel_at(panels, x, y) != nullptr;
+    const auto* object = host.dat->find_item(hit->item_type);
+    if (!object) return false;
+    const auto event_flags = tibia::client::container_item_event_flags(
+        (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+        (GetKeyState(VK_CONTROL) & 0x8000) != 0,
+        (GetKeyState(VK_MENU) & 0x8000) != 0);
+    const auto action = tibia::client::resolve_container_item_action(
+        event_flags, host.general_options_values[0],
+        object->has_native_property(7));
+    if (action == tibia::client::ContainerItemAction::open_context_menu)
+        return open_container_item_context_menu(host, window, *hit, POINT{x, y});
+    try {
+        if (action == tibia::client::ContainerItemAction::send_look_request) {
+            const auto payload = tibia::network::encode_container_look_request(
+                hit->container_id, hit->slot, hit->item_type);
+            host.send_game_payload(payload);
+            return true;
+        }
+        if (action == tibia::client::ContainerItemAction::send_use_request) {
+            const auto payload = tibia::network::encode_container_use_item_request(
+                hit->container_id, hit->slot, hit->item_type);
+            host.send_game_payload(payload);
+            return true;
+        }
+    } catch (const std::exception& error) {
+        host.notice_text = error_to_wide(error.what());
+        InvalidateRect(window, nullptr, FALSE);
+    }
+    return false;
+}
+
+void begin_move_item_drag(ClientHost& host, HWND window,
+    const tibia::network::ItemPosition& source, std::uint8_t count, POINT cursor) {
+    host.pending_move_item_source = source;
+    host.pending_move_item_count = std::max<std::uint8_t>(count, 1);
+    host.move_item_press_point = cursor;
+    host.move_item_dragging = false;
+    SetCapture(window);
+    host.mouse_buttons |= 1U;
+}
+
+bool begin_inventory_move_item_drag(ClientHost& host, HWND window, POINT cursor) {
+    if (!host.game_world_mailbox || host.inventory_minimized) return false;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return false;
+    const auto layout = tibia::client::resolve_game_window_layout({
+        client.right - client.left, client.bottom - client.top,
+        host.console_height, tibia::client::map_panel_height,
+        tibia::client::map_window_minimum_height, host.no_stretching});
+    const auto snapshot = host.game_world_mailbox->read();
+    if (!layout || !snapshot) return false;
+    const auto panels = container_panel_layouts(host, window, *snapshot, *layout);
+    if (std::any_of(panels.begin(), panels.end(), [cursor](const auto& panel) {
+            return contains_point(RECT{panel.window.x, panel.window.y,
+                panel.window.x + panel.window.width,
+                panel.window.y + panel.window.height}, cursor);
+        }))
+        return false;
+    const auto slot = tibia::client::inventory_slot_at(
+        layout->sidebar.x + tibia::client::inventory_panel_offset_x,
+        tibia::client::inventory_panel_offset_y, cursor.x, cursor.y);
+    if (!slot) return false;
+    const auto item = std::find_if(snapshot->inventory.begin(),
+        snapshot->inventory.end(), [slot](const auto& entry) {
+            return entry.slot == *slot;
+        });
+    if (item == snapshot->inventory.end() || item->item.type == 0) return false;
+    const auto* object = host.dat ? host.dat->find_item(item->item.type) : nullptr;
+    const auto count = object && object->has_native_property(5) && item->item.has_extra
+        ? std::max<std::uint8_t>(item->item.extra, 1) : std::uint8_t{1};
+    begin_move_item_drag(host, window, {0xffff, *slot, 0, item->item.type, 0},
+        count, cursor);
+    return true;
+}
+
+bool begin_map_move_item_drag(ClientHost& host, HWND window, POINT cursor) {
+    if (!host.game_world_mailbox || !host.dat) return false;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return false;
+    const auto layout = tibia::client::resolve_game_window_layout({
+        client.right - client.left, client.bottom - client.top,
+        host.console_height, tibia::client::map_panel_height,
+        tibia::client::map_window_minimum_height, host.no_stretching});
+    const auto snapshot = host.game_world_mailbox->read();
+    if (!layout || !snapshot || !snapshot->map) return false;
+    const auto camera = tibia::client::resolve_map_window_camera_offset(*snapshot);
+    if (!camera) return false;
+    const auto source = tibia::map::move_item_source_at(*snapshot, *host.dat,
+        layout->map, *camera, host.no_stretching, cursor.x, cursor.y);
+    if (!source || source->stack_position > 0xff) return false;
+    const auto* item_type = host.dat->find_item(source->object->type);
+    const auto count = source->object->has_extra && item_type &&
+        item_type->has_native_property(5)
+        ? std::max<std::uint8_t>(source->object->extra, 1)
+        : std::uint8_t{1};
+    begin_move_item_drag(host, window,
+        {source->tile->x, source->tile->y, source->tile->floor,
+            source->object->type,
+            static_cast<std::uint8_t>(source->stack_position)},
+        count, cursor);
+    return true;
+}
+
+bool send_move_item_request(ClientHost& host,
+    const tibia::network::ItemPosition& source,
+    tibia::client::MoveItemDestination destination) {
+    if (!host.dat || !host.send_game_payload) return false;
+    const auto* object = host.dat->find_item(source.item_type);
+    if (!object) return false;
+    if (object->has_native_property(0x0e)) {
+        show_notice(host, L"Tibia", L"You cannot move this object.");
+        return false;
+    }
+    auto amount = static_cast<std::uint8_t>(1);
+    const bool stackable = object->has_native_property(5) &&
+        host.pending_move_item_count > 1;
+    if (stackable) {
+        if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+            amount = 1;
+        } else if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+            amount = host.pending_move_item_count;
+        } else {
+            host.move_item_dialog = tibia::client::make_move_item_dialog_state(
+                source, destination, host.pending_move_item_count);
+            if (host.move_item_dialog) {
+                host.move_item_dialog_offset = {};
+                host.pressed_move_item_button = -1;
+                host.pressed_move_item_control = -1;
+                host.move_item_control_dragging = false;
+            }
+            return static_cast<bool>(host.move_item_dialog);
+        }
+    }
+    host.send_game_payload(tibia::network::encode_move_item_request(source,
+        destination.x, destination.y, destination.z, amount));
+    return true;
+}
+
+bool send_move_item_drop(ClientHost& host, HWND window, POINT target) {
+    if (!host.move_item_dragging || !host.pending_move_item_source) return false;
+    if (host.dat && host.send_game_payload && host.game_world_mailbox) {
+        RECT client{};
+        if (GetClientRect(window, &client)) {
+            const auto snapshot = host.game_world_mailbox->read();
+            const auto game_layout = tibia::client::resolve_game_window_layout({
+                client.right - client.left, client.bottom - client.top,
+                host.console_height, tibia::client::map_panel_height,
+                tibia::client::map_window_minimum_height, host.no_stretching});
+            if (snapshot && game_layout) {
+                const auto panels = container_panel_layouts(
+                    host, window, *snapshot, *game_layout);
+                const auto destination = tibia::client::container_item_slot_at(
+                    panels, target.x, target.y);
+                const auto covered_by_container = std::any_of(panels.begin(),
+                    panels.end(), [target](const auto& panel) {
+                        return contains_point(RECT{panel.window.x, panel.window.y,
+                            panel.window.x + panel.window.width,
+                            panel.window.y + panel.window.height}, target);
+                    });
+                const auto& source = *host.pending_move_item_source;
+                if (destination) {
+                    const auto destination_y = static_cast<std::uint16_t>(
+                        destination->container_id + 0x40U);
+                    if (source.x != 0xffff || source.y != destination_y ||
+                        source.z != destination->slot)
+                        (void)send_move_item_request(host, source,
+                            {0xffff, destination_y, destination->slot});
+                } else if (!covered_by_container) {
+                    const auto minimized_inventory_x = game_layout->sidebar.x +
+                        tibia::client::inventory_minimized_content_x;
+                    const RECT minimized_inventory_rect{minimized_inventory_x,
+                        tibia::client::inventory_minimized_content_y,
+                        minimized_inventory_x +
+                            tibia::client::inventory_minimized_content_width,
+                        tibia::client::inventory_minimized_content_y +
+                            tibia::client::inventory_minimized_content_height};
+                    const bool dropped_on_backpack = host.inventory_minimized &&
+                        contains_point(minimized_inventory_rect, target);
+                    if (dropped_on_backpack) {
+                        if (source.x != 0xffff || source.y != 0 || source.z != 0)
+                            (void)send_move_item_request(host, source,
+                                {0xffff, 0, 0});
+                    } else {
+                        const auto camera = tibia::client::resolve_map_window_camera_offset(
+                            *snapshot);
+                        if (camera) {
+                            const auto map_destination = tibia::map::map_position_at(
+                                *snapshot, *host.dat, game_layout->map, *camera,
+                                host.no_stretching, target.x, target.y);
+                            if (map_destination && (source.x != map_destination->x ||
+                                source.y != map_destination->y ||
+                                source.z != map_destination->floor))
+                                (void)send_move_item_request(host, source,
+                                    {map_destination->x, map_destination->y,
+                                        map_destination->floor});
+                        }
+                    }
+                }
+            }
+        }
+    }
+    host.pending_move_item_source.reset();
+    host.pending_move_item_count = 1;
+    host.move_item_dragging = false;
+    host.interaction_mode = tibia::client::GameInteractionMode::none;
+    return true;
+}
+
+bool submit_move_item_dialog(ClientHost& host) {
+    if (!host.move_item_dialog || !host.send_game_payload) return false;
+    const auto payload = tibia::client::encode_move_item_dialog_request(
+        *host.move_item_dialog);
+    if (!payload) return false;
+    host.send_game_payload(*payload);
+    host.move_item_dialog.reset();
+    host.move_item_dialog_offset = {};
+    host.pressed_move_item_button = -1;
+    host.pressed_move_item_control = -1;
+    host.move_item_control_dragging = false;
+    return true;
+}
+
+void cancel_move_item_dialog(ClientHost& host) {
+    host.move_item_dialog.reset();
+    host.move_item_dialog_offset = {};
+    host.pressed_move_item_button = -1;
+    host.pressed_move_item_control = -1;
+    host.move_item_control_dragging = false;
+}
+
+bool send_inventory_item_action(ClientHost& host, HWND window, POINT click) {
+    if (!host.dat || !host.send_game_payload || !host.game_world_mailbox ||
+        host.inventory_minimized)
+        return false;
+    RECT client{};
+    GetClientRect(window, &client);
+    const auto layout = tibia::client::resolve_game_window_layout({
+        client.right - client.left, client.bottom - client.top,
+        host.console_height, tibia::client::map_panel_height,
+        tibia::client::map_window_minimum_height, host.no_stretching});
+    const auto snapshot = host.game_world_mailbox->read();
+    if (!layout || !snapshot) return false;
+    const auto panels = container_panel_layouts(host, window, *snapshot, *layout);
+    if (std::any_of(panels.begin(), panels.end(), [&click](const auto& panel) {
+            return contains_point(RECT{panel.window.x, panel.window.y,
+                panel.window.x + panel.window.width,
+                panel.window.y + panel.window.height}, click);
+        }))
+        return false;
+    const auto slot = tibia::client::inventory_slot_at(
+        layout->sidebar.x + tibia::client::inventory_panel_offset_x,
+        tibia::client::inventory_panel_offset_y, click.x, click.y);
+    if (!slot) return false;
+    const auto entry = std::find_if(snapshot->inventory.begin(),
+        snapshot->inventory.end(), [slot](const auto& value) {
+            return value.slot == *slot;
+        });
+    if (entry == snapshot->inventory.end() || entry->item.type == 0) return false;
+    const auto* object = host.dat->find_item(entry->item.type);
+    if (!object) return false;
+    const auto event_flags = tibia::client::container_item_event_flags(
+        (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+        (GetKeyState(VK_CONTROL) & 0x8000) != 0,
+        (GetKeyState(VK_MENU) & 0x8000) != 0);
+    const auto action = tibia::client::resolve_container_item_action(
+        event_flags, host.general_options_values[0],
+        object->has_native_property(7));
+    const tibia::network::ItemPosition position{
+        0xffff, *slot, 0, entry->item.type, 0};
+    if (action == tibia::client::ContainerItemAction::open_context_menu)
+        return open_inventory_item_context_menu(
+            host, window, *slot, entry->item.type, click);
+    try {
+        if (action == tibia::client::ContainerItemAction::send_look_request) {
+            host.send_game_payload(tibia::network::encode_look_item_request(position));
+            return true;
+        }
+        if (action == tibia::client::ContainerItemAction::send_use_request) {
+            host.send_game_payload(tibia::network::encode_use_item_request(position));
+            return true;
+        }
+    } catch (const std::exception& error) {
+        host.notice_text = error_to_wide(error.what());
+        InvalidateRect(window, nullptr, FALSE);
+    }
+    return false;
 }
 
 void draw_container_panels(ClientHost& host,
@@ -3727,8 +4622,12 @@ void draw_container_panels(ClientHost& host,
                 return current.id == panel.id;
             });
         if (container == snapshot.containers.end()) continue;
+        const RECT item_clip{panel.item_viewport.x, panel.item_viewport.y,
+            panel.item_viewport.x + panel.item_viewport.width,
+            panel.item_viewport.y + panel.item_viewport.height};
         for (const auto& cell : panel.item_cells)
-            draw_skin_tiled(host, 102, cell.bounds.x, cell.bounds.y, 34, 34);
+            draw_skin_clipped(host, 102, cell.bounds.x, cell.bounds.y, 34, 34,
+                item_clip);
         if (panel.scrollable) {
             draw_skin_tiled(host, 153, panel.scroll_track.x, panel.scroll_track.y,
                 panel.scroll_track.width, panel.scroll_track.height);
@@ -3743,19 +4642,44 @@ void draw_container_panels(ClientHost& host,
                 panel.scroll_thumb.width, cap);
         }
         if (!panel.minimized) {
-            draw_skin(host, 157, panel.scroll_buttons[0].x,
+            const auto scroll_button_pressed = [&host, &panel](int part) {
+                const auto& bounds = panel.scroll_buttons[
+                    static_cast<std::size_t>(part)];
+                return host.pressed_container_scroll_id == panel.id &&
+                    host.pressed_container_scroll_part == part &&
+                    (host.mouse_buttons & 1U) != 0 && contains_point(
+                        RECT{bounds.x, bounds.y, bounds.x + bounds.width,
+                            bounds.y + bounds.height}, host.mouse);
+            };
+            draw_skin(host, scroll_button_pressed(0) ? 158 : 157,
+                panel.scroll_buttons[0].x,
                 panel.scroll_buttons[0].y, panel.scroll_buttons[0].width,
                 panel.scroll_buttons[0].height);
-            draw_skin(host, 159, panel.scroll_buttons[1].x,
+            draw_skin(host, scroll_button_pressed(1) ? 160 : 159,
+                panel.scroll_buttons[1].x,
                 panel.scroll_buttons[1].y, panel.scroll_buttons[1].width,
                 panel.scroll_buttons[1].height);
         }
-        draw_skin(host, 126, panel.higher_button.x, panel.higher_button.y,
-            panel.higher_button.width, panel.higher_button.height);
-        draw_skin(host, panel.minimized ? 139 : 138,
+        const auto button_is_pressed = [&host, &panel](int button,
+            const tibia::client::ContentWindowRect& bounds) {
+            return host.pressed_container_header_id == panel.id &&
+                host.pressed_container_header_button == button &&
+                (host.mouse_buttons & 1U) != 0 && contains_point(
+                    RECT{bounds.x, bounds.y, bounds.x + bounds.width,
+                        bounds.y + bounds.height}, host.mouse);
+        };
+        if (panel.has_parent)
+            draw_skin(host, button_is_pressed(3, panel.higher_button) ? 127 : 126,
+                panel.higher_button.x, panel.higher_button.y,
+                panel.higher_button.width, panel.higher_button.height);
+        const bool minimize_pressed = button_is_pressed(1,
+            panel.minimize_button);
+        draw_skin(host, minimize_pressed ? (panel.minimized ? 138 : 139)
+                : (panel.minimized ? 139 : 138),
             panel.minimize_button.x, panel.minimize_button.y,
             panel.minimize_button.width, panel.minimize_button.height);
-        draw_skin(host, 136, panel.close_button.x, panel.close_button.y,
+        draw_skin(host, button_is_pressed(2, panel.close_button) ? 137 : 136,
+            panel.close_button.x, panel.close_button.y,
             panel.close_button.width, panel.close_button.height);
         const auto header = tibia::client::layout_skills_panel_header(panel.window);
         draw_bitmap_text(host, decode_ui_string(container->name), header.title.x,
@@ -3781,7 +4705,10 @@ void draw_container_panels(ClientHost& host,
                 const auto width = bitmap_text_width(host, label, 1, host.window);
                 const auto position = tibia::client::inventory_quantity_position(
                     cell.bounds.x, cell.bounds.y, width);
-                draw_bitmap_text(host, label, position.x, position.y, 0, false, 1, 192);
+            const RECT clip{panel.item_viewport.x, panel.item_viewport.y,
+                panel.item_viewport.x + panel.item_viewport.width,
+                panel.item_viewport.y + panel.item_viewport.height};
+            draw_bitmap_text_clipped(host, label, position.x, position.y, clip, 1, 192);
             }
         }
     }
@@ -3873,10 +4800,14 @@ std::optional<tibia::client::VipPanelWindowPlan> vip_panel_window_plan(
     const auto automap_y = host.inventory_minimized
         ? tibia::client::automap_panel_minimized_inventory_y
         : tibia::client::automap_panel_full_inventory_y;
+    const auto contact_order = tibia::client::make_vip_contact_order(
+        snapshot->vip_contacts, host.vip_buddy_preferences,
+        host.vip_sort_methods, host.vip_hide_offline);
     auto plan = tibia::client::make_vip_panel_window_plan(
         client.right - client.left, client.bottom - client.top,
         content_window_origin_y(automap_y),
-        restored_windows, snapshot->vip_contacts, host.vip_scroll_value);
+        restored_windows, snapshot->vip_contacts, host.vip_scroll_value,
+        std::span<const std::size_t>(contact_order));
     if (plan && host.vip_window_natural_height == 0 &&
         !host.vip_window_minimized && host.vip_window_restore_height == 0) {
         const auto restored = std::find_if(host.restored_content_windows.begin(),
@@ -4107,10 +5038,20 @@ void draw_battle_content_window(ClientHost& host,
             scrollbar.thumb.y + scrollbar.thumb.height - cap,
             scrollbar.thumb.width, cap);
     }
-    draw_skin(host, host.pressed_battle_scrollbar_part == 0 ? 158 : 157,
+    const RECT up_arrow{scrollbar.up_arrow.x, scrollbar.up_arrow.y,
+        scrollbar.up_arrow.x + scrollbar.up_arrow.width,
+        scrollbar.up_arrow.y + scrollbar.up_arrow.height};
+    const RECT down_arrow{scrollbar.down_arrow.x, scrollbar.down_arrow.y,
+        scrollbar.down_arrow.x + scrollbar.down_arrow.width,
+        scrollbar.down_arrow.y + scrollbar.down_arrow.height};
+    const bool up_pressed = host.pressed_battle_scrollbar_part == 0 &&
+        (host.mouse_buttons & 1U) != 0 && contains_point(up_arrow, host.mouse);
+    const bool down_pressed = host.pressed_battle_scrollbar_part == 1 &&
+        (host.mouse_buttons & 1U) != 0 && contains_point(down_arrow, host.mouse);
+    draw_skin(host, up_pressed ? 158 : 157,
         scrollbar.up_arrow.x, scrollbar.up_arrow.y,
         scrollbar.up_arrow.width, scrollbar.up_arrow.height);
-    draw_skin(host, host.pressed_battle_scrollbar_part == 1 ? 160 : 159,
+    draw_skin(host, down_pressed ? 160 : 159,
         scrollbar.down_arrow.x, scrollbar.down_arrow.y,
         scrollbar.down_arrow.width, scrollbar.down_arrow.height);
 }
@@ -4206,10 +5147,20 @@ void draw_vip_content_window(ClientHost& host,
             scrollbar.thumb.y + scrollbar.thumb.height - cap,
             scrollbar.thumb.width, cap);
     }
-    draw_skin(host, host.pressed_vip_scrollbar_part == 0 ? 158 : 157,
+    const RECT up_arrow{scrollbar.up_arrow.x, scrollbar.up_arrow.y,
+        scrollbar.up_arrow.x + scrollbar.up_arrow.width,
+        scrollbar.up_arrow.y + scrollbar.up_arrow.height};
+    const RECT down_arrow{scrollbar.down_arrow.x, scrollbar.down_arrow.y,
+        scrollbar.down_arrow.x + scrollbar.down_arrow.width,
+        scrollbar.down_arrow.y + scrollbar.down_arrow.height};
+    const bool up_pressed = host.pressed_vip_scrollbar_part == 0 &&
+        (host.mouse_buttons & 1U) != 0 && contains_point(up_arrow, host.mouse);
+    const bool down_pressed = host.pressed_vip_scrollbar_part == 1 &&
+        (host.mouse_buttons & 1U) != 0 && contains_point(down_arrow, host.mouse);
+    draw_skin(host, up_pressed ? 158 : 157,
         scrollbar.up_arrow.x, scrollbar.up_arrow.y,
         scrollbar.up_arrow.width, scrollbar.up_arrow.height);
-    draw_skin(host, host.pressed_vip_scrollbar_part == 1 ? 160 : 159,
+    draw_skin(host, down_pressed ? 160 : 159,
         scrollbar.down_arrow.x, scrollbar.down_arrow.y,
         scrollbar.down_arrow.width, scrollbar.down_arrow.height);
 }
@@ -4345,8 +5296,10 @@ void open_vip_context_menu(ClientHost& host, HWND window,
         }
         options.push_back({{}, {}, true});
         host.vip_context_player_name = name;
+        host.vip_context_player_id = contact->id;
     } else {
         host.vip_context_player_name.clear();
+        host.vip_context_player_id = 0;
     }
     options.push_back({tibia::client::VipContextAction::add_new,
         L"Add new VIP", false});
@@ -4354,15 +5307,20 @@ void open_vip_context_menu(ClientHost& host, HWND window,
         L"Sort by name", false});
     options.push_back({tibia::client::VipContextAction::sort_type,
         L"Sort by type", false});
-    options.push_back({tibia::client::VipContextAction::sort_status,
-        L"Sort by status", false});
+    if (!host.vip_hide_offline)
+        options.push_back({tibia::client::VipContextAction::sort_status,
+            L"Sort by status", false});
     options.push_back({tibia::client::VipContextAction::toggle_offline,
-        L"Hide offline VIPs", false});
+        host.vip_hide_offline ? L"Show offline VIPs" : L"Hide offline VIPs", false});
     if (contact) {
         options.push_back({{}, {}, true});
         options.push_back({tibia::client::VipContextAction::copy_name,
             L"Copy Name", false});
-        if (snapshot->server_right_values_received) {
+        if (snapshot->server_right_values_received &&
+            std::any_of(snapshot->server_right_values.begin(),
+                snapshot->server_right_values.end(), [](std::uint8_t value) {
+                    return value != 0;
+                })) {
             options.push_back({{}, {}, true});
             options.push_back({tibia::client::VipContextAction::rule_violation,
                 L"Rule Violation", false});
@@ -4506,6 +5464,18 @@ const tibia::client::ConsoleContextMenuItem* console_context_menu_item_at(
     return nullptr;
 }
 
+const tibia::client::ContainerItemContextOption*
+container_item_context_option_at(const ClientHost& host, POINT point) {
+    if (!host.container_item_context_menu) return nullptr;
+    for (const auto& option : host.container_item_context_menu->options) {
+        if (contains_point(RECT{option.rect.x, option.rect.y,
+                option.rect.x + option.rect.width,
+                option.rect.y + option.rect.height}, point))
+            return &option;
+    }
+    return nullptr;
+}
+
 const tibia::client::VipContextMenuEntry* vip_context_menu_entry_at(
     const ClientHost& host, POINT point) {
     if (!host.vip_context_menu) return nullptr;
@@ -4516,9 +5486,71 @@ const tibia::client::VipContextMenuEntry* vip_context_menu_entry_at(
     return nullptr;
 }
 
+void persist_vip_preferences(ClientHost& host) {
+    try {
+        auto preferences = tibia::client::read_communication_preferences(
+            host.communication_config_path);
+        preferences.buddy_sort_methods = host.vip_sort_methods;
+        preferences.buddy_hide_offline = host.vip_hide_offline;
+        preferences.buddies = host.vip_buddy_preferences;
+        tibia::client::write_communication_preferences(
+            host.communication_config_path, preferences);
+    } catch (const std::exception& error) {
+        host.notice_text = error_to_wide(error.what());
+    }
+}
+
+void open_vip_edit_dialog(ClientHost& host);
+
 void apply_vip_context_menu_action(ClientHost& host, HWND window,
     tibia::client::VipContextAction action) {
-    if (action == tibia::client::VipContextAction::message ||
+    if (action == tibia::client::VipContextAction::edit) {
+        open_vip_edit_dialog(host);
+    } else if (action == tibia::client::VipContextAction::add_new) {
+        host.vip_add_dialog_open = true;
+        host.vip_add_name.clear();
+        host.vip_add_name_focused = true;
+        host.pressed_vip_add_button = -1;
+        host.vip_add_dialog_offset = {};
+    }
+    std::int32_t selected_sort_method = -1;
+    if (action == tibia::client::VipContextAction::sort_name)
+        selected_sort_method = 0;
+    else if (action == tibia::client::VipContextAction::sort_type)
+        selected_sort_method = 1;
+    else if (action == tibia::client::VipContextAction::sort_status)
+        selected_sort_method = 2;
+    if (selected_sort_method >= 0) {
+        auto methods = host.vip_sort_methods;
+        if (tibia::client::promote_vip_sort_method(methods, selected_sort_method)) {
+            if (host.vip_hide_offline && selected_sort_method != 2)
+                (void)tibia::client::promote_vip_sort_method(methods, 2);
+            host.vip_sort_methods = methods;
+            persist_vip_preferences(host);
+        }
+    } else if (action == tibia::client::VipContextAction::toggle_offline) {
+        host.vip_hide_offline = !host.vip_hide_offline;
+        if (host.vip_hide_offline)
+            (void)tibia::client::promote_vip_sort_method(host.vip_sort_methods, 2);
+        persist_vip_preferences(host);
+    } else if (action == tibia::client::VipContextAction::remove &&
+        host.vip_context_player_id != 0) {
+        const auto id = host.vip_context_player_id;
+        if (host.game_world_mailbox)
+            host.game_world_mailbox->remove_vip_contact(id);
+        std::erase_if(host.vip_buddy_preferences, [id](const auto& buddy) {
+            return buddy.id == id;
+        });
+        persist_vip_preferences(host);
+        if (host.send_game_payload) {
+            try {
+                const auto payload = tibia::network::encode_state6_remove_vip_request(id);
+                host.send_game_payload(payload);
+            } catch (const std::exception& error) {
+                host.notice_text = error_to_wide(error.what());
+            }
+        }
+    } else if (action == tibia::client::VipContextAction::message ||
         action == tibia::client::VipContextAction::invite_private) {
         if (!host.vip_context_player_name.empty() && host.send_game_payload) {
             tibia::network::PacketWriter writer;
@@ -4532,13 +5564,128 @@ void apply_vip_context_menu_action(ClientHost& host, HWND window,
                 host.notice_text = error_to_wide(error.what());
             }
         }
+    } else if (action == tibia::client::VipContextAction::rule_violation) {
+        const auto snapshot = host.game_world_mailbox->read();
+        if (snapshot && snapshot->server_right_values_received &&
+            !host.vip_context_player_name.empty()) {
+            host.rule_violation_request_form.show(snapshot->server_right_values);
+            host.rule_violation_request_form.player_name =
+                host.vip_context_player_name;
+            host.rule_violation_request_reason_scroll = 0;
+            host.rule_violation_request_action_scroll = 0;
+            host.rule_violation_request_focus_field = -1;
+            host.rule_violation_request_dialog_offset = {};
+            host.pressed_rule_violation_request_button = -1;
+        }
     } else if (action == tibia::client::VipContextAction::copy_name &&
         !host.vip_context_player_name.empty()) {
         (void)copy_text_to_clipboard(window, host.vip_context_player_name);
     }
     host.vip_context_menu.reset();
     host.pressed_vip_context_menu_action = -1;
+    host.vip_context_player_id = 0;
     InvalidateRect(window, nullptr, FALSE);
+}
+
+void close_vip_add_dialog(ClientHost& host) {
+    host.vip_add_dialog_open = false;
+    host.vip_add_name.clear();
+    host.vip_add_name_focused = false;
+    host.pressed_vip_add_button = -1;
+    host.vip_add_dialog_offset = {};
+}
+
+void open_vip_edit_dialog(ClientHost& host) {
+    if (host.vip_context_player_id == 0 || host.vip_context_player_name.empty())
+        return;
+    host.vip_edit_dialog_open = true;
+    host.vip_edit_contact_id = host.vip_context_player_id;
+    host.vip_edit_player_name = host.vip_context_player_name;
+    host.vip_edit_type = 0;
+    host.vip_edit_notify = false;
+    host.vip_edit_description.clear();
+    host.vip_edit_description_scroll = 0;
+    host.pressed_vip_edit_scroll_part = -1;
+    host.vip_edit_scrollbar_dragging = false;
+    host.vip_edit_scrollbar_grab_offset = 0;
+    const auto buddy = std::find_if(host.vip_buddy_preferences.begin(),
+        host.vip_buddy_preferences.end(), [&](const auto& entry) {
+            return entry.id == host.vip_edit_contact_id;
+        });
+    if (buddy != host.vip_buddy_preferences.end()) {
+        host.vip_edit_type = std::clamp(buddy->type, 0, 10);
+        host.vip_edit_notify = buddy->enabled;
+        host.vip_edit_description = error_to_wide(buddy->name.c_str());
+    }
+    host.vip_edit_description_focused = false;
+    host.pressed_vip_edit_button = -1;
+    host.pressed_vip_edit_type = -1;
+    host.pressed_vip_edit_notify = false;
+    host.vip_edit_dialog_offset = {};
+}
+
+void close_vip_edit_dialog(ClientHost& host) {
+    host.vip_edit_dialog_open = false;
+    host.vip_edit_contact_id = 0;
+    host.vip_edit_player_name.clear();
+    host.vip_edit_description.clear();
+    host.vip_edit_type = 0;
+    host.vip_edit_notify = false;
+    host.vip_edit_description_focused = false;
+    host.vip_edit_description_scroll = 0;
+    host.pressed_vip_edit_scroll_part = -1;
+    host.vip_edit_scrollbar_dragging = false;
+    host.vip_edit_scrollbar_grab_offset = 0;
+    host.pressed_vip_edit_button = -1;
+    host.pressed_vip_edit_type = -1;
+    host.pressed_vip_edit_notify = false;
+    host.vip_edit_dialog_offset = {};
+}
+
+void submit_vip_edit_dialog(ClientHost& host) {
+    if (!host.vip_edit_dialog_open || host.vip_edit_contact_id == 0) return;
+    const auto description = encode_ui_string(host.vip_edit_description);
+    const bool has_local_preference = host.vip_edit_type != 0 ||
+        !host.vip_edit_description.empty() || host.vip_edit_notify;
+    if (!has_local_preference) {
+        std::erase_if(host.vip_buddy_preferences, [&](const auto& entry) {
+            return entry.id == host.vip_edit_contact_id;
+        });
+    } else {
+        const auto buddy = std::find_if(host.vip_buddy_preferences.begin(),
+        host.vip_buddy_preferences.end(), [&](const auto& entry) {
+            return entry.id == host.vip_edit_contact_id;
+        });
+        if (buddy == host.vip_buddy_preferences.end()) {
+            host.vip_buddy_preferences.push_back({host.vip_edit_contact_id,
+                host.vip_edit_type, description, host.vip_edit_notify});
+        } else {
+            buddy->type = host.vip_edit_type;
+            buddy->enabled = host.vip_edit_notify;
+            buddy->name = description;
+        }
+    }
+    persist_vip_preferences(host);
+    close_vip_edit_dialog(host);
+}
+
+void submit_vip_add_dialog(ClientHost& host) {
+    if (!host.vip_add_dialog_open) return;
+    if (host.vip_add_name.empty()) {
+        close_vip_add_dialog(host);
+        return;
+    }
+    if (!host.send_game_payload) return;
+    tibia::network::PacketWriter writer;
+    writer.write_u8(0xdc);
+    writer.write_string(encode_ui_string(host.vip_add_name));
+    const auto payload = std::move(writer).take();
+    try {
+        host.send_game_payload(payload);
+        close_vip_add_dialog(host);
+    } catch (const std::exception& error) {
+        host.notice_text = error_to_wide(error.what());
+    }
 }
 
 void draw_console_context_menu(ClientHost& host) {
@@ -4555,6 +5702,23 @@ void draw_console_context_menu(ClientHost& host) {
                 item.rect.y, item.rect.width, item.rect.height);
         draw_bitmap_text(host, item.label, item.rect.x + 2,
             item.rect.y + 2, item.rect.width - 4, false, 1, 224, false);
+    }
+}
+
+void draw_container_item_context_menu(ClientHost& host) {
+    if (!host.container_item_context_menu) return;
+    const auto& menu = *host.container_item_context_menu;
+    if (menu.window.width <= 0 || menu.window.height <= 0) return;
+    draw_context_menu_frame(host, menu.window);
+    for (const auto& option : menu.options) {
+        const RECT rect{option.rect.x, option.rect.y,
+            option.rect.x + option.rect.width,
+            option.rect.y + option.rect.height};
+        if (contains_point(rect, host.mouse))
+            host.renderer->draw(skills_menu_selection_texture, option.rect.x,
+                option.rect.y, option.rect.width, option.rect.height);
+        draw_bitmap_text(host, option.label, option.rect.x + 2,
+            option.rect.y + 2, option.rect.width - 4, false, 1, 224, false);
     }
 }
 
@@ -4794,7 +5958,25 @@ void open_battle_context_menu(ClientHost& host, HWND window,
             return row.creature.creature_id == creature_id;
         });
     std::vector<tibia::client::BattleContextMenuOption> player_options;
+    bool rule_violation_available = false;
     if (creature_id >= 0x40000000U && creature != host.battle_panel_rows.end()) {
+        const auto snapshot = host.game_world_mailbox
+            ? host.game_world_mailbox->read() : nullptr;
+        rule_violation_available = snapshot && snapshot->server_right_values_received &&
+            std::any_of(snapshot->server_right_values.begin(),
+                snapshot->server_right_values.end(), [](std::uint8_t value) {
+                    return value != 0;
+                });
+        const auto party_flag = [](const auto& state) {
+            constexpr auto party_flag_offset = std::uint16_t{0x98};
+            if (party_flag_offset <
+                tibia::network::State6CreatureRuntimeState::first_native_offset)
+                return std::uint8_t{};
+            const auto index = static_cast<std::size_t>(party_flag_offset -
+                tibia::network::State6CreatureRuntimeState::first_native_offset);
+            return index < state.native_fields.size()
+                ? state.native_fields[index] : std::uint8_t{};
+        };
         const auto preferences = tibia::client::read_communication_preferences(
             host.communication_config_path);
         const auto same_name = [](std::string_view left, std::string_view right) {
@@ -4806,7 +5988,17 @@ void open_battle_context_menu(ClientHost& host, HWND window,
         };
         player_options.push_back({tibia::client::BattleTargetAction::message_to,
             L"Message to " + error_to_wide(creature->name.c_str())});
-        const auto snapshot = host.game_world_mailbox->read();
+        if (host.communication_session_mailbox &&
+            host.communication_session_mailbox->private_channel_filter_available()) {
+            const auto channel = host.communication_session_mailbox->channel_view();
+            const bool active_private_channel = channel.selected_identifier &&
+                *channel.selected_identifier >= 9;
+            player_options.push_back({active_private_channel
+                    ? tibia::client::BattleTargetAction::exclude_private
+                    : tibia::client::BattleTargetAction::invite_private,
+                active_private_channel ? L"Exclude from private chat"
+                                       : L"Invite to private chat"});
+        }
         const auto is_vip = snapshot && std::any_of(snapshot->vip_contacts.begin(),
             snapshot->vip_contacts.end(), [&creature, &same_name](const auto& contact) {
                 return same_name(contact.name, creature->name);
@@ -4821,6 +6013,19 @@ void open_battle_context_menu(ClientHost& host, HWND window,
         const auto player_name = error_to_wide(creature->name.c_str());
         player_options.push_back({tibia::client::BattleTargetAction::toggle_ignore,
             std::wstring(is_ignored ? L"Unignore " : L"Ignore ") + player_name});
+        if (snapshot && snapshot->map) {
+            const auto local = std::find_if(snapshot->creatures.begin(),
+                snapshot->creatures.end(), [snapshot](const auto& entry) {
+                    return entry.state.creature_id == snapshot->map->local_player_id;
+                });
+            if (local != snapshot->creatures.end()) {
+                auto party_options = tibia::client::battle_party_context_options(
+                    party_flag(local->state), creature->party_shield, player_name);
+                player_options.insert(player_options.end(),
+                    std::make_move_iterator(party_options.begin()),
+                    std::make_move_iterator(party_options.end()));
+            }
+        }
     }
     const auto attack_label = host.battle_targets.attack_target == creature_id
         ? std::wstring_view(L"Stop Attack") : std::wstring_view(L"Attack");
@@ -4832,10 +6037,13 @@ void open_battle_context_menu(ClientHost& host, HWND window,
         bitmap_text_width(host, L"Copy Name", 1, window)};
     for (const auto& option : player_options)
         widths.push_back(bitmap_text_width(host, option.label, 1, window));
+    if (rule_violation_available)
+        widths.push_back(bitmap_text_width(host, L"Rule Violation", 1, window));
     host.battle_context_menu = tibia::client::make_battle_context_menu_plan(
         host.battle_targets, creature_id, std::move(player_options), widths,
         std::max(1, host.ui_font_heights[1]), anchor.x, anchor.y,
-        client.right - client.left, client.bottom - client.top);
+        client.right - client.left, client.bottom - client.top,
+        rule_violation_available);
     host.pressed_battle_context_menu_action = -1;
     InvalidateRect(window, nullptr, FALSE);
 }
@@ -4871,12 +6079,42 @@ void copy_battle_creature_name(ClientHost& host, std::uint32_t creature_id) {
 
 void apply_battle_target_command(ClientHost& host,
     tibia::client::BattleTargetAction action, std::uint32_t creature_id) {
+    if (action == tibia::client::BattleTargetAction::rule_violation) {
+        const auto creature = std::find_if(host.battle_panel_rows.begin(),
+            host.battle_panel_rows.end(), [creature_id](const auto& row) {
+                return row.creature.creature_id == creature_id;
+            });
+        const auto snapshot = host.game_world_mailbox
+            ? host.game_world_mailbox->read() : nullptr;
+        if (creature != host.battle_panel_rows.end() && snapshot &&
+            snapshot->server_right_values_received &&
+            std::any_of(snapshot->server_right_values.begin(),
+                snapshot->server_right_values.end(), [](std::uint8_t value) {
+                    return value != 0;
+                })) {
+            host.rule_violation_request_form.show(snapshot->server_right_values);
+            host.rule_violation_request_form.player_name =
+                error_to_wide(creature->name.c_str());
+            host.rule_violation_request_reason_scroll = 0;
+            host.rule_violation_request_action_scroll = 0;
+            host.rule_violation_request_focus_field = -1;
+            host.rule_violation_request_dialog_offset = {};
+            host.pressed_rule_violation_request_button = -1;
+        }
+        return;
+    }
     if (action == tibia::client::BattleTargetAction::copy_name) {
         copy_battle_creature_name(host, creature_id);
         return;
     }
     if (action == tibia::client::BattleTargetAction::message_to ||
-        action == tibia::client::BattleTargetAction::add_vip) {
+        action == tibia::client::BattleTargetAction::invite_private ||
+        action == tibia::client::BattleTargetAction::exclude_private ||
+        action == tibia::client::BattleTargetAction::add_vip ||
+        action == tibia::client::BattleTargetAction::invite_party ||
+        action == tibia::client::BattleTargetAction::join_party ||
+        action == tibia::client::BattleTargetAction::revoke_party_invitation ||
+        action == tibia::client::BattleTargetAction::pass_party_leadership) {
         const auto creature = std::find_if(host.battle_panel_rows.begin(),
             host.battle_panel_rows.end(), [creature_id](const auto& row) {
                 return row.creature.creature_id == creature_id;
@@ -4884,9 +6122,22 @@ void apply_battle_target_command(ClientHost& host,
         if (creature == host.battle_panel_rows.end() || !host.send_game_payload)
             return;
         tibia::network::PacketWriter writer;
-        writer.write_u8(action == tibia::client::BattleTargetAction::message_to
-            ? 0x9a : 0xdc);
-        writer.write_string(creature->name);
+        const auto opcode = action == tibia::client::BattleTargetAction::message_to
+            ? 0x9a : action == tibia::client::BattleTargetAction::invite_private
+                ? 0xab : action == tibia::client::BattleTargetAction::exclude_private
+                    ? 0xac : action == tibia::client::BattleTargetAction::add_vip
+                        ? 0xdc : action == tibia::client::BattleTargetAction::invite_party
+                            ? 0xa3 : action == tibia::client::BattleTargetAction::join_party
+                                ? 0xa4 : action == tibia::client::BattleTargetAction::revoke_party_invitation
+                                    ? 0xa5 : 0xa6;
+        writer.write_u8(static_cast<std::uint8_t>(opcode));
+        if (action == tibia::client::BattleTargetAction::invite_party ||
+            action == tibia::client::BattleTargetAction::join_party ||
+            action == tibia::client::BattleTargetAction::revoke_party_invitation ||
+            action == tibia::client::BattleTargetAction::pass_party_leadership)
+            writer.write_u32(creature_id);
+        else
+            writer.write_string(creature->name);
         const auto payload = std::move(writer).take();
         try {
             host.send_game_payload(payload);
@@ -5176,6 +6427,105 @@ RECT new_channel_native_rect(const tibia::client::ConsolePanelRect& rect) {
     return {rect.x, rect.y, rect.x + rect.width, rect.y + rect.height};
 }
 
+RECT vip_add_native_rect(const tibia::client::ContentWindowRect& rect) {
+    return {rect.x, rect.y, rect.x + rect.width, rect.y + rect.height};
+}
+
+tibia::client::VipAddDialogLayout vip_add_layout(const ClientHost& host,
+    POINT offset = {}) {
+    RECT client{};
+    GetClientRect(host.window, &client);
+    return tibia::client::resolve_vip_add_dialog_layout(
+        client.right - client.left, client.bottom - client.top,
+        ui_units(host.window, 1), offset.x, offset.y);
+}
+
+RECT vip_add_dialog_rect(const ClientHost& host, POINT offset = {}) {
+    return vip_add_native_rect(vip_add_layout(host, offset).dialog);
+}
+
+RECT vip_add_button_rect(const ClientHost& host, int index) {
+    const auto layout = vip_add_layout(host, host.vip_add_dialog_offset);
+    return vip_add_native_rect(index == 0 ? layout.ok_button : layout.cancel_button);
+}
+
+RECT vip_edit_native_rect(const tibia::client::ContentWindowRect& rect) {
+    return {rect.x, rect.y, rect.x + rect.width, rect.y + rect.height};
+}
+
+tibia::client::VipEditDialogLayout vip_edit_layout(const ClientHost& host,
+    POINT offset = {}) {
+    RECT client{};
+    GetClientRect(host.window, &client);
+    return tibia::client::resolve_vip_edit_dialog_layout(
+        client.right - client.left, client.bottom - client.top,
+        ui_units(host.window, 1), offset.x, offset.y);
+}
+
+RECT vip_edit_dialog_rect(const ClientHost& host, POINT offset = {}) {
+    return vip_edit_native_rect(vip_edit_layout(host, offset).dialog);
+}
+
+RECT vip_edit_button_rect(const ClientHost& host, int index) {
+    const auto layout = vip_edit_layout(host, host.vip_edit_dialog_offset);
+    return vip_edit_native_rect(index == 0 ? layout.ok_button : layout.cancel_button);
+}
+
+struct VipEditDescriptionScrollPlan {
+    RECT field;
+    RECT text_view;
+    std::vector<std::wstring> lines;
+    int visible_lines{};
+    int maximum_scroll{};
+    tibia::client::UiScrollbarGeometry scrollbar;
+};
+
+VipEditDescriptionScrollPlan vip_edit_description_scroll_plan(
+    const ClientHost& host, POINT offset = {}) {
+    const auto layout = vip_edit_layout(host, offset);
+    const auto field = vip_edit_native_rect(layout.description_field);
+    const int scrollbar_width = ui_units(host.window, 12);
+    const int scrollbar_height = ui_units(host.window, 38);
+    const int inset = ui_units(host.window, 3);
+    const int text_width = std::max(1, static_cast<int>(
+        field.right - field.left) - scrollbar_width - inset * 2);
+    auto lines = wrap_bitmap_lines(host, host.vip_edit_description,
+        text_width, 3);
+    const int line_height = ui_units(host.window, 12);
+    const int visible_lines = std::max(1, static_cast<int>(
+        field.bottom - field.top - inset * 2) / line_height);
+    const int maximum_scroll = std::max(0,
+        static_cast<int>(lines.size()) - visible_lines);
+    const int offset_y = std::clamp(host.vip_edit_description_scroll,
+        0, maximum_scroll);
+    return {field,
+        {field.left + inset, field.top + inset,
+            field.right - scrollbar_width - inset, field.bottom - inset},
+        std::move(lines), visible_lines, maximum_scroll,
+        tibia::client::ui_scrollbar_geometry(
+            field.right - field.left, scrollbar_height,
+            static_cast<std::size_t>(maximum_scroll + visible_lines),
+            visible_lines, offset_y, 0, scrollbar_width, scrollbar_width,
+            ui_units(host.window, 6))};
+}
+
+RECT vip_edit_scrollbar_part_rect(const VipEditDescriptionScrollPlan& plan,
+    const tibia::client::UiScrollbarRect& part) {
+    return {plan.field.left + part.left, plan.field.top + part.top,
+        plan.field.left + part.right, plan.field.top + part.bottom};
+}
+
+void reveal_vip_edit_description_caret(ClientHost& host) {
+    host.vip_edit_description_scroll = vip_edit_description_scroll_plan(host,
+        host.vip_edit_dialog_offset).maximum_scroll;
+}
+
+bool vip_edit_description_can_append(const ClientHost& host, wchar_t value) {
+    auto candidate = host.vip_edit_description;
+    candidate.push_back(value);
+    return encode_ui_string(candidate).size() <= 0x7f;
+}
+
 tibia::client::NewChannelDialogLayout new_channel_layout(
     const ClientHost& host, POINT offset = {}) {
     RECT client{};
@@ -5293,6 +6643,158 @@ void draw_new_channel_dialog(ClientHost& host) {
         draw_bitmap_text(host, index == 0 ? L"Ok" : L"Cancel",
             button.left, button.top + 6 * unit, button.right - button.left,
             true, 2, 255);
+    }
+}
+
+void draw_vip_add_dialog(ClientHost& host) {
+    const auto layout = vip_add_layout(host, host.vip_add_dialog_offset);
+    const auto dialog = vip_add_native_rect(layout.dialog);
+    const auto label = vip_add_native_rect(layout.name_label);
+    const auto field = vip_add_native_rect(layout.name_field);
+    const int unit = ui_units(host.window, 1);
+    draw_original_dialog_frame(host, dialog);
+    draw_bitmap_text(host, L"Add to VIP list", dialog.left + ui_units(host.window, 5),
+        dialog.top + ui_units(host.window, 5), dialog.right - dialog.left - ui_units(host.window, 10),
+        true, 3, 144);
+    draw_bitmap_text(host, L"Please enter a character name:", label.left,
+        label.top, label.right - label.left, false, 3, 192);
+    host.renderer->draw(login_field_background_texture, field.left, field.top,
+        field.right - field.left, field.bottom - field.top);
+    draw_login_field_bevel(host, field);
+    const int inset = ui_units(host.window, 3);
+    const int text_x = field.left + inset;
+    const int text_y = field.top + inset;
+    draw_bitmap_text(host, host.vip_add_name, text_x, text_y,
+        std::max(0, static_cast<int>(field.right - field.left) - inset * 2),
+        false, 3, 224);
+    if (host.vip_add_name_focused && ((GetTickCount64() / 500U) & 1U) == 0) {
+        const int caret_x = std::min(static_cast<int>(field.right) - inset,
+            text_x + bitmap_text_width(host, host.vip_add_name, 3, host.window));
+        host.renderer->draw(login_caret_texture, caret_x, text_y,
+            unit, std::max(1, static_cast<int>(field.bottom - field.top) - inset * 2));
+    }
+    for (int index = 0; index < 2; ++index) {
+        const auto button = vip_add_button_rect(host, index);
+        draw_skin(host, host.pressed_vip_add_button == index ? 13 : 12,
+            button.left, button.top, button.right - button.left,
+            button.bottom - button.top);
+        draw_bitmap_text(host, index == 0 ? L"Ok" : L"Cancel",
+            button.left, button.top + ui_units(host.window, 6),
+            button.right - button.left, true, 2, 255);
+    }
+}
+
+void draw_vip_edit_dialog(ClientHost& host) {
+    const auto layout = vip_edit_layout(host, host.vip_edit_dialog_offset);
+    const auto dialog = vip_edit_native_rect(layout.dialog);
+    const auto name = vip_edit_native_rect(layout.player_name);
+    const auto separator = vip_edit_native_rect(layout.player_name_separator);
+    const auto type_label = vip_edit_native_rect(layout.type_label);
+    const auto description_label = vip_edit_native_rect(layout.description_label);
+    const auto scroll = vip_edit_description_scroll_plan(host,
+        host.vip_edit_dialog_offset);
+    const auto field = scroll.field;
+    const auto notify = vip_edit_native_rect(layout.notify_checkbox);
+    const int unit = ui_units(host.window, 1);
+    draw_original_dialog_frame(host, dialog);
+    draw_bitmap_text(host, L"Change player in VIP list",
+        dialog.left + ui_units(host.window, 5),
+        dialog.top + ui_units(host.window, 5),
+        dialog.right - dialog.left - ui_units(host.window, 10), true, 3, 144);
+    draw_bitmap_text(host, host.vip_edit_player_name, name.left, name.top,
+        name.right - name.left, false, 3, 192);
+    host.renderer->draw(ui_separator_shadow_texture, separator.left,
+        separator.top, separator.right - separator.left, unit);
+    host.renderer->draw(ui_separator_highlight_texture, separator.left,
+        separator.top + unit, separator.right - separator.left, unit);
+    draw_bitmap_text(host, L"Select a type:", type_label.left, type_label.top,
+        type_label.right - type_label.left, false, 3, 192);
+    for (std::size_t index = 0; index < layout.type_buttons.size(); ++index) {
+        const auto rect = vip_edit_native_rect(layout.type_buttons[index]);
+        draw_skin(host, host.vip_edit_type == static_cast<int>(index) ? 158 : 157,
+            rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+        if (index != 0) {
+            const auto icon = static_cast<std::uint16_t>(0xdd + index);
+            const auto& skin = tibia::client::ui_skins[icon];
+            draw_skin(host, icon,
+                rect.left + ((rect.right - rect.left) - ui_units(host.window, skin.width)) / 2,
+                rect.top + ((rect.bottom - rect.top) - ui_units(host.window, skin.height)) / 2,
+                ui_units(host.window, skin.width), ui_units(host.window, skin.height));
+        }
+    }
+    draw_bitmap_text(host, L"Enter a short description:",
+        description_label.left, description_label.top,
+        description_label.right - description_label.left, false, 3, 192);
+    host.renderer->draw(login_field_background_texture, field.left, field.top,
+        field.right - field.left, field.bottom - field.top);
+    draw_login_field_bevel(host, field);
+    const int scroll_offset = std::clamp(host.vip_edit_description_scroll,
+        0, scroll.maximum_scroll);
+    host.vip_edit_description_scroll = scroll_offset;
+    const int line_height = ui_units(host.window, 12);
+    for (int row = 0; row < scroll.visible_lines; ++row) {
+        const auto line_index = static_cast<std::size_t>(scroll_offset + row);
+        if (line_index >= scroll.lines.size()) break;
+        draw_bitmap_text(host, scroll.lines[line_index], scroll.text_view.left,
+            scroll.text_view.top + row * line_height,
+            scroll.text_view.right - scroll.text_view.left, false, 3, 224);
+    }
+    if (host.vip_edit_description_focused && ((GetTickCount64() / 500U) & 1U) == 0) {
+        const int caret_row = static_cast<int>(scroll.lines.size()) - 1 - scroll_offset;
+        if (caret_row >= 0 && caret_row < scroll.visible_lines) {
+            const std::wstring_view line = scroll.lines.empty()
+                ? std::wstring_view{}
+                : std::wstring_view(scroll.lines.back());
+            const int caret_x = std::min(scroll.text_view.right,
+                scroll.text_view.left + bitmap_text_width(host, line, 3, host.window));
+            const int caret_y = scroll.text_view.top + caret_row * line_height;
+            host.renderer->draw(login_caret_texture, caret_x, caret_y, unit,
+                std::max(1, ui_units(host.window, 10)));
+        }
+    }
+    const auto& scrollbar = scroll.scrollbar;
+    const auto track = vip_edit_scrollbar_part_rect(scroll, scrollbar.track);
+    if (scrollbar.thumb_visible) {
+        draw_skin_tiled(host, 153, track.left, track.top,
+            track.right - track.left, track.bottom - track.top);
+        const auto thumb = vip_edit_scrollbar_part_rect(scroll,
+            scrollbar.thumb);
+        const int cap = std::min(ui_units(host.window, 6),
+            static_cast<int>(thumb.bottom - thumb.top) / 2);
+        draw_skin(host, 154, thumb.left, thumb.top,
+            thumb.right - thumb.left, cap);
+        draw_skin_tiled(host, 155, thumb.left, thumb.top + cap,
+            thumb.right - thumb.left, thumb.bottom - thumb.top - 2 * cap);
+        draw_skin(host, 156, thumb.left, thumb.bottom - cap,
+            thumb.right - thumb.left, cap);
+    }
+    const auto up = vip_edit_scrollbar_part_rect(scroll, scrollbar.up_arrow);
+    const auto down = vip_edit_scrollbar_part_rect(scroll, scrollbar.down_arrow);
+    const bool pressed_up = host.pressed_vip_edit_scroll_part == 0 &&
+        (host.mouse_buttons & 1U) != 0 && contains_point(up, host.mouse);
+    const bool pressed_down = host.pressed_vip_edit_scroll_part == 1 &&
+        (host.mouse_buttons & 1U) != 0 && contains_point(down, host.mouse);
+    draw_skin(host, pressed_up ? 158 : 157, up.left, up.top,
+        up.right - up.left, up.bottom - up.top);
+    draw_skin(host, pressed_down ? 160 : 159, down.left, down.top,
+        down.right - down.left, down.bottom - down.top);
+    draw_skin(host, host.vip_edit_notify ? 150 : 151,
+        notify.left + ui_units(host.window, 6),
+        notify.top + ui_units(host.window, 5), ui_units(host.window, 12),
+        ui_units(host.window, 12));
+    draw_bitmap_text(host, L"Notify at login",
+        notify.left + ui_units(host.window, 24),
+        centered_bitmap_text_y(host, notify.top + ui_units(host.window, 5),
+            ui_units(host.window, 12), 3),
+        notify.right - notify.left - ui_units(host.window, 24), false, 3, 192);
+    for (int index = 0; index < 2; ++index) {
+        const auto button = vip_edit_button_rect(host, index);
+        draw_skin(host, host.pressed_vip_edit_button == index ? 13 : 12,
+            button.left, button.top, button.right - button.left,
+            button.bottom - button.top);
+        draw_bitmap_text(host, index == 0 ? L"Ok" : L"Cancel",
+            button.left, button.top + ui_units(host.window, 6),
+            button.right - button.left, true, 2, 255);
     }
 }
 
@@ -5551,6 +7053,136 @@ RECT notice_button_rect(const ClientHost& host) {
 
 void draw_message_dialog(ClientHost& host, std::wstring_view title,
     std::wstring_view text, int pressed_button, const RECT& dialog);
+
+void draw_original_range_control(ClientHost& host, const RECT& slider,
+    int value, int minimum, int maximum, bool decrease_pressed,
+    bool increase_pressed, int page_size) {
+    const auto scale = ui_scale(host.window);
+    const auto s = [scale](int item) {
+        return std::max(1, static_cast<int>(std::lround(static_cast<float>(item) * scale)));
+    };
+    const int button_width = s(12);
+    const int track_left = slider.left + button_width;
+    const int track_right = slider.right - button_width;
+    const int track_width = std::max(0, track_right - track_left);
+    draw_skin(host, decrease_pressed ? 166 : 165, slider.left, slider.top,
+        button_width, s(12));
+    draw_skin(host, increase_pressed ? 168 : 167, slider.right - button_width,
+        slider.top, button_width, s(12));
+    if (track_width > 0)
+        draw_skin_tiled(host, 161, track_left, slider.top, track_width, s(12));
+    const int minimum_thumb_width = s(12);
+    const int value_range = std::max(0, maximum - minimum);
+    const int thumb_width = value_range == 0 ? track_width : std::clamp(
+        track_width * std::max(1, page_size) /
+            (value_range + std::max(1, page_size)),
+        std::min(minimum_thumb_width, track_width), track_width);
+    const int usable = std::max(0, track_width - thumb_width);
+    const int clamped = std::clamp(value, minimum, maximum);
+    const int thumb_x = maximum == minimum ? track_left : track_left +
+        (clamped - minimum) * usable / (maximum - minimum);
+    const int thumb_cap_width = std::min(s(6), thumb_width / 2);
+    draw_skin(host, 162, thumb_x, slider.top, thumb_cap_width, s(12));
+    draw_skin(host, 163, thumb_x + thumb_cap_width, slider.top,
+        std::max(0, thumb_width - thumb_cap_width * 2), s(12));
+    draw_skin(host, 164, thumb_x + thumb_width - thumb_cap_width,
+        slider.top, thumb_cap_width, s(12));
+}
+
+RECT move_item_range_thumb(const ClientHost& host, const RECT& slider);
+
+int move_item_amount_from_pointer(const ClientHost& host, const RECT& slider,
+    int thumb_left) {
+    if (!host.move_item_dialog) return 1;
+    const int minimum = 1;
+    const int maximum = host.move_item_dialog->maximum_amount;
+    if (maximum <= minimum) return minimum;
+    const auto thumb = move_item_range_thumb(host, slider);
+    const int track_left = slider.left + ui_units(host.window, 12);
+    const int track_width = std::max(0,
+        static_cast<int>(slider.right - slider.left) - ui_units(host.window, 24));
+    const int travel = std::max(0, track_width -
+        static_cast<int>(thumb.right - thumb.left));
+    const int position = std::clamp(thumb_left - track_left, 0, travel);
+    const int value = minimum + position * (maximum - minimum + 1) / (travel + 1);
+    return std::clamp(value, minimum, maximum);
+}
+
+RECT move_item_range_thumb(const ClientHost& host, const RECT& slider) {
+    const auto scale = ui_scale(host.window);
+    const int s12 = std::max(1, static_cast<int>(std::lround(12.0F * scale)));
+    const int track_left = slider.left + s12;
+    const int track_right = slider.right - s12;
+    const int track_width = std::max(0, track_right - track_left);
+    const int maximum = host.move_item_dialog
+        ? host.move_item_dialog->maximum_amount : 1;
+    const int amount = host.move_item_dialog
+        ? host.move_item_dialog->amount : 1;
+    const int value_range = std::max(0, maximum - 1);
+    const int thumb_width = value_range == 0 ? track_width : std::clamp(
+        track_width * 11 / (value_range + 11),
+        std::min(s12, track_width), track_width);
+    const int travel = std::max(0, track_width - thumb_width);
+    const int left = maximum <= 1 ? track_left : track_left +
+        (amount - 1) * travel / (maximum - 1);
+    return {left, slider.top, left + thumb_width, slider.top + s12};
+}
+
+RECT move_item_dialog_rect(const ClientHost& host, POINT offset = {}) {
+    RECT client{};
+    GetClientRect(host.window, &client);
+    const auto layout = tibia::client::resolve_move_item_dialog_layout(
+        client.right - client.left, client.bottom - client.top,
+        ui_units(host.window, 1), offset.x, offset.y);
+    return {layout.dialog.x, layout.dialog.y,
+        layout.dialog.x + layout.dialog.width,
+        layout.dialog.y + layout.dialog.height};
+}
+
+void draw_move_item_dialog(ClientHost& host) {
+    if (!host.move_item_dialog) return;
+    RECT client{};
+    GetClientRect(host.window, &client);
+    const auto layout = tibia::client::resolve_move_item_dialog_layout(
+        client.right - client.left, client.bottom - client.top,
+        ui_units(host.window, 1), host.move_item_dialog_offset.x,
+        host.move_item_dialog_offset.y);
+    const auto native_rect = [](const tibia::client::ContentWindowRect& rect) {
+        return RECT{rect.x, rect.y, rect.x + rect.width, rect.y + rect.height};
+    };
+    const auto dialog = native_rect(layout.dialog);
+    draw_original_dialog_frame(host, dialog);
+    draw_bitmap_text(host, L"Move Objects", layout.title.x, layout.title.y,
+        layout.title.width, true, 3, 144);
+    draw_bitmap_text(host, L"Set the number of", layout.prompt.x, layout.prompt.y,
+        layout.prompt.width, false, 3, 192);
+    draw_bitmap_text(host, L"items you want to move:", layout.prompt.x,
+        layout.prompt.y + ui_units(host.window,
+            std::max(1, host.ui_font_heights[3])), layout.prompt.width,
+        false, 3, 192);
+    const auto range = native_rect(layout.amount_field);
+    draw_original_range_control(host, range, host.move_item_dialog->amount, 1,
+        host.move_item_dialog->maximum_amount,
+        host.pressed_move_item_control == 0,
+        host.pressed_move_item_control == 1, 11);
+    const auto separator = native_rect(layout.separator);
+    host.renderer->draw(ui_separator_shadow_texture, separator.left, separator.top,
+        separator.right - separator.left, ui_units(host.window, 1));
+    host.renderer->draw(ui_separator_highlight_texture, separator.left,
+        separator.top + ui_units(host.window, 1),
+        separator.right - separator.left, ui_units(host.window, 1));
+    const std::array<std::wstring_view, 2> labels{L"Ok", L"Cancel"};
+    const std::array<tibia::client::ContentWindowRect, 2> buttons{
+        layout.ok_button, layout.cancel_button};
+    for (std::size_t index = 0; index < buttons.size(); ++index) {
+        const auto button = native_rect(buttons[index]);
+        draw_skin(host, host.pressed_move_item_button == static_cast<int>(index)
+            ? 13 : 12, button.left, button.top,
+            button.right - button.left, button.bottom - button.top);
+        draw_bitmap_text(host, labels[index], button.left, button.top +
+            ui_units(host.window, 6), button.right - button.left, true, 2, 255);
+    }
+}
 
 void draw_notice(ClientHost& host) {
     if (!host.notice_text.empty())
@@ -6701,33 +8333,10 @@ void draw_graphics_options_page(ClientHost& host) {
 }
 
 void draw_advanced_graphics_slider(ClientHost& host, const RECT& slider,
-    int value, int minimum, int maximum, int control_id) {
-    const auto scale = ui_scale(host.window);
-    const auto s = [scale](int item) {
-        return std::max(1, static_cast<int>(std::lround(static_cast<float>(item) * scale)));
-    };
-    const int button_width = s(12);
-    const int track_left = slider.left + button_width;
-    const int track_right = slider.right - button_width;
-    const int track_width = std::max(0, track_right - track_left);
-    draw_skin(host, host.pressed_advanced_graphics_control == control_id + 10 ? 166 : 165,
-        slider.left, slider.top, button_width, s(12));
-    draw_skin(host, host.pressed_advanced_graphics_control == control_id + 11 ? 168 : 167,
-        slider.right - button_width, slider.top, button_width, s(12));
-    const int cap_width = s(6);
-    if (track_width > 0) {
-        draw_skin(host, 162, track_left, slider.top, cap_width, s(12));
-        draw_skin_tiled(host, 161, track_left + cap_width, slider.top,
-            std::max(0, track_width - cap_width * 2), s(12));
-        draw_skin(host, 164, track_right - cap_width, slider.top, cap_width, s(12));
-    }
-    const int thumb_width = s(32);
-    const int usable = std::max(0, track_width - thumb_width);
-    const int clamped = std::clamp(value, minimum, maximum);
-    const float ratio = maximum == minimum ? 0.0F :
-        static_cast<float>(clamped - minimum) / static_cast<float>(maximum - minimum);
-    const int thumb_x = track_left + static_cast<int>(std::lround(usable * ratio));
-    draw_skin(host, 163, thumb_x, slider.top, thumb_width, s(12));
+    int value, int minimum, int maximum, int control_id, int page_size) {
+    draw_original_range_control(host, slider, value, minimum, maximum,
+        host.pressed_advanced_graphics_control == control_id + 10,
+        host.pressed_advanced_graphics_control == control_id + 11, page_size);
 }
 
 void draw_advanced_graphics_options_page(ClientHost& host) {
@@ -6771,7 +8380,7 @@ void draw_advanced_graphics_options_page(ClientHost& host) {
     draw_advanced_graphics_slider(host, advanced_graphics_slider_rect(host.window,
         host.advanced_graphics_options_dialog_offset,
         tibia::client::advanced_graphics_ambient_slider_y),
-        host.advanced_graphics_brightness, 0, 128, 3);
+        host.advanced_graphics_brightness, 0, 128, 3, 8);
 
     constexpr std::array<std::wstring_view, 3> checkbox_labels{
         L"Show Light Effects", L"Don't Stretch/Shrink Game Window",
@@ -6810,7 +8419,7 @@ void draw_advanced_graphics_options_page(ClientHost& host) {
         tibia::client::advanced_graphics_framerate_slider_y),
         host.advanced_graphics_framerate,
         tibia::client::advanced_graphics_slider_minimum,
-        tibia::client::advanced_graphics_slider_maximum, 7);
+        tibia::client::advanced_graphics_slider_maximum, 7, 11);
     wchar_t framerate_label[64]{};
     swprintf_s(framerate_label, L"Current framerate: %2.2f", host.measured_framerate);
     draw_bitmap_text(host, framerate_label, x,
@@ -7394,16 +9003,24 @@ void start_game_transport(ClientHost& host, HWND window, const CharacterChoice& 
     const auto game_world_mailbox = host.game_world_mailbox;
     const auto dat = host.dat;
     game_world_mailbox->clear();
+    {
+        const std::lock_guard movement_lock(host.game_movement_input_mutex);
+        host.game_movement_input_state = {};
+    }
     host.battle_targets = {};
     host.battle_context_menu.reset();
     host.pressed_battle_context_menu_action = -1;
     host.vip_context_menu.reset();
     host.pressed_vip_context_menu_action = -1;
     host.vip_context_player_name.clear();
+    host.vip_context_player_id = 0;
     host.pressed_battle_creature_id = 0;
     const auto map_extra_ids = host.map_item_ids_with_extra_byte;
     const auto communication_preferences = tibia::client::read_communication_preferences(
         host.communication_config_path);
+    host.vip_sort_methods = communication_preferences.buddy_sort_methods;
+    host.vip_buddy_preferences = communication_preferences.buddies;
+    host.vip_hide_offline = communication_preferences.buddy_hide_offline;
     const auto communication_session_mailbox = host.communication_session_mailbox;
     communication_session_mailbox->publish_ignore_list(communication_preferences.ignore_list);
     communication_session_mailbox->publish_private_channel_filter_state(false);
@@ -7502,6 +9119,8 @@ void start_game_transport(ClientHost& host, HWND window, const CharacterChoice& 
         wire_request, communication_preferences, visual_update_rate, send_mutex,
         report_violation_buffer, player_level, communication_session_mailbox,
         stop_action_reset_pending,
+        movement_input = &host.game_movement_input_state,
+        movement_input_mutex = &host.game_movement_input_mutex,
         prepared = std::move(prepared)](std::stop_token stop) {
         bool completed = false;
         try {
@@ -7641,15 +9260,24 @@ void start_game_transport(ClientHost& host, HWND window, const CharacterChoice& 
                 });
             tibia::network::register_observed_state6_map_thing_add_handler(dispatcher,
                 [mailbox, window, &current_map, &creature_states,
-                    &player_movement_globals, dat](
+                    &player_movement_globals, dat,
+                    movement_input, movement_input_mutex](
                     const tibia::network::State6MapThingAdd& add) {
                     if (current_map)
                         tibia::network::apply_state6_map_thing_add(*current_map, *dat, add);
                     if (current_map) creature_states.observe_map(*current_map, false);
                     if (current_map && current_map->local_player_id != 0 &&
                         add.object.creature_id == current_map->local_player_id) {
+                        const std::lock_guard movement_lock(*movement_input_mutex);
                         (void)tibia::network::apply_observed_state6_local_player_reset(
                             player_movement_globals, creature_states, current_map->local_player_id);
+                        movement_input->local_player_id = current_map->local_player_id;
+                        movement_input->last_target = {};
+                        movement_input->has_last_target = false;
+                        movement_input->queued_step_count = 0;
+                        movement_input->current_step_index = 0;
+                        movement_input->pending_path_search = 0;
+                        movement_input->has_route_progress = true;
                     }
                     publish_login_event(mailbox, window,
                         LoginUiEvent{std::nullopt,
@@ -7714,16 +9342,59 @@ void start_game_transport(ClientHost& host, HWND window, const CharacterChoice& 
                 });
             tibia::network::register_observed_state6_thing_move_handler(dispatcher,
                 [mailbox, window, &current_map, &player_movement_globals,
-                    &creature_states, dat](
+                    &creature_states, dat,
+                    movement_input, movement_input_mutex](
                     const tibia::network::State6ThingMove& move) {
                     if (current_map) {
+                        const std::lock_guard movement_lock(*movement_input_mutex);
+                        if (movement_input->local_player_id == current_map->local_player_id) {
+                            if (movement_input->has_route_progress) {
+                                player_movement_globals.at_0x006059DC =
+                                    movement_input->queued_step_count;
+                                player_movement_globals.at_0x006059D8 =
+                                    movement_input->current_step_index;
+                                player_movement_globals.at_0x006059D4 =
+                                    movement_input->pending_path_search;
+                            }
+                            player_movement_globals.at_0x00605A14 =
+                                movement_input->last_target[0];
+                            player_movement_globals.at_0x00605A10 =
+                                movement_input->last_target[1];
+                            player_movement_globals.at_0x00605A0C =
+                                movement_input->last_target[2];
+                            player_movement_globals.at_0x00605A09 =
+                                movement_input->option_0x05A09;
+                            player_movement_globals.at_0x00605A08 =
+                                movement_input->option_0x05A08;
+                        }
                         const auto first_timer_sample = static_cast<std::uint32_t>(
                             timeGetTime() - animation_epoch_tick);
                         const auto second_timer_sample = static_cast<std::uint32_t>(
                             timeGetTime() - animation_epoch_tick);
-                        (void)tibia::network::apply_observed_state6_thing_move(
+                        const auto moves_local_player =
+                            tibia::network::apply_observed_state6_thing_move(
                             *current_map, creature_states, player_movement_globals, *dat,
                             first_timer_sample, second_timer_sample, move);
+                        if (moves_local_player) {
+                            movement_input->local_player_id = current_map->local_player_id;
+                            movement_input->queued_step_count =
+                                player_movement_globals.at_0x006059DC;
+                            movement_input->current_step_index =
+                                player_movement_globals.at_0x006059D8;
+                            movement_input->pending_path_search =
+                                player_movement_globals.at_0x006059D4;
+                            movement_input->has_route_progress = true;
+                            movement_input->last_target = {
+                                player_movement_globals.at_0x00605A14,
+                                player_movement_globals.at_0x00605A10,
+                                player_movement_globals.at_0x00605A0C};
+                            movement_input->option_0x05A09 =
+                                player_movement_globals.at_0x00605A09;
+                            movement_input->option_0x05A08 =
+                                player_movement_globals.at_0x00605A08;
+                            movement_input->has_last_target =
+                                player_movement_globals.at_0x00605A14 != 0;
+                        }
                     }
                     publish_login_event(mailbox, window,
                         LoginUiEvent{std::nullopt,
@@ -7866,11 +9537,42 @@ void start_game_transport(ClientHost& host, HWND window, const CharacterChoice& 
                         communication_session.has_active_private_channel_filter());
                 });
             tibia::network::register_observed_state6_opcode_b5_handler(dispatcher,
-                [&current_map, &creature_states, &player_movement_globals](std::uint8_t key_state) {
+                [&current_map, &creature_states, &player_movement_globals,
+                    movement_input, movement_input_mutex](
+                    std::uint8_t key_state) {
                     if (!current_map || current_map->local_player_id == 0) return;
+                    const std::lock_guard movement_lock(*movement_input_mutex);
+                    if (movement_input->local_player_id == current_map->local_player_id) {
+                        if (movement_input->has_route_progress) {
+                            player_movement_globals.at_0x006059DC =
+                                movement_input->queued_step_count;
+                            player_movement_globals.at_0x006059D8 =
+                                movement_input->current_step_index;
+                            player_movement_globals.at_0x006059D4 =
+                                movement_input->pending_path_search;
+                        }
+                        player_movement_globals.at_0x00605A14 =
+                            movement_input->last_target[0];
+                        player_movement_globals.at_0x00605A10 =
+                            movement_input->last_target[1];
+                        player_movement_globals.at_0x00605A0C =
+                            movement_input->last_target[2];
+                        player_movement_globals.at_0x00605A09 =
+                            movement_input->option_0x05A09;
+                        player_movement_globals.at_0x00605A08 =
+                            movement_input->option_0x05A08;
+                    }
                     (void)tibia::network::apply_observed_state6_opcode_b5_input(
                         player_movement_globals, creature_states, current_map->local_player_id,
                         key_state);
+                    movement_input->local_player_id = current_map->local_player_id;
+                    movement_input->queued_step_count =
+                        player_movement_globals.at_0x006059DC;
+                    movement_input->current_step_index =
+                        player_movement_globals.at_0x006059D8;
+                    movement_input->pending_path_search =
+                        player_movement_globals.at_0x006059D4;
+                    movement_input->has_route_progress = true;
                 });
             tibia::network::register_observed_state6_remaining_record_handlers(dispatcher,
                 [&session_projection](const tibia::network::State6RecoveredRecord& record) {
@@ -7963,9 +9665,16 @@ void start_game_transport(ClientHost& host, HWND window, const CharacterChoice& 
                     publish_world_snapshot();
                     PostMessageW(window, game_world_message, 0, 0);
                 }
-                for (const auto& message : communication_session_mailbox->take_local_messages())
-                    (void)communication_session.apply_local_message(
+                bool local_messages_changed = false;
+                for (const auto& message : communication_session_mailbox->take_local_messages()) {
+                    const auto result = communication_session.apply_local_message(
                         message.mode, message.text, std::time(nullptr));
+                    local_messages_changed = local_messages_changed || result.sent_to_primary;
+                }
+                if (local_messages_changed) {
+                    publish_world_snapshot();
+                    PostMessageW(window, game_world_message, 0, 0);
+                }
                 const auto status_messages =
                     communication_session_mailbox->take_status_messages();
                 for (const auto& message : status_messages)
@@ -7977,6 +9686,16 @@ void start_game_transport(ClientHost& host, HWND window, const CharacterChoice& 
                     player_movement_globals.at_0x006059D4 = 0;
                     player_movement_globals.at_0x0060599C = 0;
                     player_movement_globals.at_0x00605998 = 0;
+                    {
+                        const std::lock_guard movement_lock(*movement_input_mutex);
+                        movement_input->local_player_id = local_player_id;
+                        movement_input->last_target = {};
+                        movement_input->has_last_target = false;
+                        movement_input->queued_step_count = 0;
+                        movement_input->current_step_index = 0;
+                        movement_input->pending_path_search = 0;
+                        movement_input->has_route_progress = true;
+                    }
                     publish_world_snapshot();
                 }
                 if (frame_period == std::chrono::steady_clock::duration::zero() ||
@@ -8038,16 +9757,6 @@ void start_game_transport(ClientHost& host, HWND window, const CharacterChoice& 
                                         std::to_wstring(opcode) + L"; world processing remains pending.",
                                     true, true});
                             completed = true;
-                        } else if (opcode != 0x1E && opcode != 0x0B && opcode != 0x0A &&
-                            opcode != 0x64 && (opcode < 0x65 || opcode > 0x72) &&
-                            (opcode < 0x78 || opcode > 0x79) &&
-                            (opcode < 0x7D || opcode > 0x7F) &&
-                            (opcode < 0xAB || opcode > 0xB4)) {
-                            publish_login_event(mailbox, window,
-                                LoginUiEvent{std::nullopt,
-                                    L"Observed state-6 opcode " + std::to_wstring(opcode) +
-                                        L" parsed; world-state handling is pending.",
-                                    false, true});
                         }
                         if (result.unconsumed_bytes > message.size())
                             throw std::runtime_error("game server handler returned an invalid message offset");
@@ -8755,7 +10464,11 @@ void render_frame(ClientHost& host) {
         if (host.screen == UiScreen::game_world)
             draw_console_context_menu(host);
         if (host.screen == UiScreen::game_world)
+            draw_container_item_context_menu(host);
+        if (host.screen == UiScreen::game_world)
             draw_vip_context_menu(host);
+        if (host.window && visible_dialog == ActiveDialog::move_item)
+            draw_move_item_dialog(host);
         if (host.window && visible_dialog == ActiveDialog::options) {
             const auto dialog = options_rect(host.window, host.options_dialog_offset);
             draw_dialog_frame(host, dialog);
@@ -8786,6 +10499,10 @@ void render_frame(ClientHost& host) {
             draw_rule_violation_request_dialog(host);
         if (host.window && visible_dialog == ActiveDialog::new_channel)
             draw_new_channel_dialog(host);
+        if (host.window && visible_dialog == ActiveDialog::vip_edit)
+            draw_vip_edit_dialog(host);
+        if (host.window && visible_dialog == ActiveDialog::vip_add)
+            draw_vip_add_dialog(host);
         if (host.window && visible_dialog == ActiveDialog::quest_log)
             draw_quest_log_dialog(host);
         if (host.window && visible_dialog == ActiveDialog::quest_line)
@@ -9305,6 +11022,68 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             return 0;
         }
         if (host && wparam == game_frame_timer_id && host->screen == UiScreen::game_world) {
+            if (host->dat && host->game_world_mailbox && host->send_game_payload) {
+                const auto snapshot = host->game_world_mailbox->read();
+                if (snapshot && snapshot->map &&
+                    snapshot->map->local_player_id != 0) {
+                    bool route_due = false;
+                    std::array<std::uint32_t, 3> route_target{};
+                    {
+                        const std::lock_guard movement_lock(
+                            host->game_movement_input_mutex);
+                        const auto& movement = host->game_movement_input_state;
+                        route_due = movement.local_player_id ==
+                                snapshot->map->local_player_id &&
+                            movement.has_last_target && movement.has_route_progress &&
+                            movement.current_step_index >= movement.queued_step_count;
+                        route_target = movement.last_target;
+                    }
+                    if (route_due) {
+                        const auto player = std::find_if(snapshot->creatures.begin(),
+                            snapshot->creatures.end(), [&snapshot](const auto& creature) {
+                                return creature.state.creature_id ==
+                                    snapshot->map->local_player_id;
+                            });
+                        if (player != snapshot->creatures.end()) {
+                            const tibia::network::State6PlayerPosition current{
+                                player->world_x, player->world_y, player->world_floor};
+                            const tibia::network::State6PlayerPosition target{
+                                route_target[0], route_target[1], route_target[2]};
+                            if (tibia::network::state6_path_target_is_near(
+                                    current, target)) {
+                                const auto path_grid =
+                                    host->game_world_mailbox->path_search_grid(current);
+                                if (path_grid) {
+                                    std::optional<tibia::client::GameMovementRequest> request;
+                                    {
+                                        const std::lock_guard movement_lock(
+                                            host->game_movement_input_mutex);
+                                        request = tibia::client::continue_map_walk_request(
+                                            *snapshot, *host->dat, *path_grid,
+                                            static_cast<std::uint32_t>(
+                                                timeGetTime() - animation_epoch_tick),
+                                            host->game_movement_input_state);
+                                    }
+                                    if (request) {
+                                        if (!request->status_message.empty()) {
+                                            if (host->communication_session_mailbox)
+                                                host->communication_session_mailbox->
+                                                    enqueue_status_message(request->status_message);
+                                        } else if (!request->payload.empty()) {
+                                            try {
+                                                host->send_game_payload(request->payload);
+                                            } catch (const std::exception& error) {
+                                                show_notice(*host, L"Tibia",
+                                                    error_to_wide(error.what()));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
@@ -9329,6 +11108,11 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
         if (host && wparam < host->keys.size()) host->keys[wparam] = true;
         if (wparam == VK_ESCAPE) { SendMessageW(window, escape_ui_message, 0, 0); return 0; }
+        if (host && host->move_item_dialog && wparam == VK_RETURN) {
+            (void)submit_move_item_dialog(*host);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
         if (host && host->screen == UiScreen::game_world &&
             active_dialog(*host) == ActiveDialog::none &&
             !host->console_input_focused &&
@@ -9356,6 +11140,23 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
         }
         if (host && host->new_channel_dialog_open && wparam == VK_RETURN) {
             submit_new_channel_dialog(*host);
+            return 0;
+        }
+        if (host && host->vip_add_dialog_open && wparam == VK_RETURN) {
+            submit_vip_add_dialog(*host);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+        if (host && host->vip_edit_dialog_open && wparam == VK_RETURN) {
+            if (host->vip_edit_description_focused) {
+                if (vip_edit_description_can_append(*host, L'\n')) {
+                    host->vip_edit_description.push_back(L'\n');
+                    reveal_vip_edit_description_caret(*host);
+                }
+            } else {
+                submit_vip_edit_dialog(*host);
+            }
+            InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
         if (host && host->screen == UiScreen::game_world &&
@@ -9532,6 +11333,45 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             }
             return 0;
         }
+        if (host && host->screen == UiScreen::game_world &&
+            active_dialog(*host) == ActiveDialog::none &&
+            !host->console_input_focused && host->dat &&
+            host->game_world_mailbox && host->send_game_payload) {
+            std::optional<tibia::client::GameMovementKey> movement_key;
+            switch (wparam) {
+            case VK_UP: movement_key = tibia::client::GameMovementKey::north; break;
+            case VK_LEFT: movement_key = tibia::client::GameMovementKey::west; break;
+            case VK_RIGHT: movement_key = tibia::client::GameMovementKey::east; break;
+            case VK_DOWN: movement_key = tibia::client::GameMovementKey::south; break;
+            }
+            if (movement_key) {
+                const auto snapshot = host->game_world_mailbox->read();
+                if (snapshot) {
+                    std::optional<tibia::client::GameMovementRequest> request;
+                    {
+                        const std::lock_guard movement_lock(
+                            host->game_movement_input_mutex);
+                        request = tibia::client::make_game_movement_request(
+                            *snapshot, *host->dat, *movement_key,
+                            host->game_movement_input_state);
+                    }
+                    if (request) {
+                        if (request->target_blocked) {
+                            if (host->communication_session_mailbox)
+                                host->communication_session_mailbox->enqueue_status_message(
+                                    "Sorry, not possible.");
+                        } else if (!request->payload.empty()) {
+                            try {
+                                host->send_game_payload(request->payload);
+                            } catch (const std::exception& error) {
+                                show_notice(*host, L"Tibia", error_to_wide(error.what()));
+                            }
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
         if (host && host->screen == UiScreen::login) {
             if (wparam == VK_TAB) {
                 host->login_focus_field = 1 - host->login_focus_field;
@@ -9557,9 +11397,23 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
         if (host) {
             if (!host->connection_status_text.empty()) {
                 return 0;
+            } else if (host->move_item_dialog) {
+                cancel_move_item_dialog(*host);
+                host->dragged_dialog = ClientHost::DraggedDialog::none;
+                InvalidateRect(window, nullptr, FALSE);
+            } else if (host->vip_add_dialog_open) {
+                close_vip_add_dialog(*host);
+                InvalidateRect(window, nullptr, FALSE);
+            } else if (host->vip_edit_dialog_open) {
+                close_vip_edit_dialog(*host);
+                InvalidateRect(window, nullptr, FALSE);
             } else if (host->battle_context_menu) {
                 host->battle_context_menu.reset();
                 host->pressed_battle_context_menu_action = -1;
+                InvalidateRect(window, nullptr, FALSE);
+            } else if (host->container_item_context_menu) {
+                host->container_item_context_menu.reset();
+                host->pressed_container_item_context_action = -1;
                 InvalidateRect(window, nullptr, FALSE);
             } else if (host->vip_context_menu) {
                 host->vip_context_menu.reset();
@@ -9681,6 +11535,7 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
         }
         return 0;
     case WM_CHAR:
+        if (host && host->move_item_dialog) return 0;
         if (host && host->rule_violation_request_form.open &&
             host->rule_violation_request_focus_field >= 0) {
             auto& form = host->rule_violation_request_form;
@@ -9700,6 +11555,37 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 }
                 InvalidateRect(window, nullptr, FALSE);
             }
+            return 0;
+        }
+        if (host && host->vip_edit_dialog_open &&
+            host->vip_edit_description_focused) {
+            if (wparam == VK_BACK) {
+                if (!host->vip_edit_description.empty()) {
+                    const wchar_t removed = host->vip_edit_description.back();
+                    host->vip_edit_description.pop_back();
+                    if (removed >= 0xdc00 && removed <= 0xdfff &&
+                        !host->vip_edit_description.empty() &&
+                        host->vip_edit_description.back() >= 0xd800 &&
+                        host->vip_edit_description.back() <= 0xdbff)
+                        host->vip_edit_description.pop_back();
+                }
+            } else if (wparam >= 32 && wparam <= 0xffff &&
+                vip_edit_description_can_append(*host,
+                    static_cast<wchar_t>(wparam))) {
+                host->vip_edit_description.push_back(static_cast<wchar_t>(wparam));
+                reveal_vip_edit_description_caret(*host);
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+        if (host && host->vip_add_dialog_open && host->vip_add_name_focused) {
+            if (wparam == VK_BACK) {
+                if (!host->vip_add_name.empty()) host->vip_add_name.pop_back();
+            } else if (wparam >= 32 && wparam <= 0xffff &&
+                host->vip_add_name.size() < 29) {
+                host->vip_add_name.push_back(static_cast<wchar_t>(wparam));
+            }
+            InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
         if (host && host->new_channel_dialog_open && host->private_channel_focused) {
@@ -9794,10 +11680,41 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             host->mouse_position_known = true;
             if (!host->windows_mouse_pointer ||
                 host->pressed_console_transcript_scrollbar_part == 0 ||
-                host->pressed_console_transcript_scrollbar_part == 1)
+                host->pressed_console_transcript_scrollbar_part == 1 ||
+                host->pressed_skills_scrollbar_part >= 0 ||
+                host->pressed_battle_scrollbar_part >= 0 ||
+                host->pressed_vip_scrollbar_part >= 0)
                 InvalidateRect(window, nullptr, FALSE);
             if (host->skills_context_menu) InvalidateRect(window, nullptr, FALSE);
             host->dragging = (wparam & MK_LBUTTON) != 0;
+            if (host->move_item_dialog && host->move_item_control_dragging &&
+                host->dragging) {
+                RECT client{};
+                GetClientRect(window, &client);
+                const auto layout = tibia::client::resolve_move_item_dialog_layout(
+                    client.right - client.left, client.bottom - client.top,
+                    ui_units(window, 1), host->move_item_dialog_offset.x,
+                    host->move_item_dialog_offset.y);
+                const RECT slider{layout.amount_field.x, layout.amount_field.y,
+                    layout.amount_field.x + layout.amount_field.width,
+                    layout.amount_field.y + layout.amount_field.height};
+                const int thumb_left = host->mouse.x -
+                    host->move_item_thumb_grab_offset;
+                const int amount = move_item_amount_from_pointer(
+                    *host, slider, thumb_left);
+                (void)tibia::client::set_move_item_dialog_amount(
+                    *host->move_item_dialog, static_cast<std::uint8_t>(amount));
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            if (host->dragging && host->pending_move_item_source &&
+                !host->move_item_dragging &&
+                (std::abs(host->mouse.x - host->move_item_press_point.x) > 3 ||
+                    std::abs(host->mouse.y - host->move_item_press_point.y) > 3)) {
+                host->move_item_dragging = true;
+                host->interaction_mode =
+                    tibia::client::GameInteractionMode::move_item;
+                InvalidateRect(window, nullptr, FALSE);
+            }
             if (host->console_transcript_selecting &&
                 host->screen == UiScreen::game_world &&
                 update_console_transcript_selection(*host, host->mouse)) {
@@ -9902,14 +11819,28 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                                 });
                             if (panel != panels.end() && state !=
                                     host->container_panel_states.end()) {
-                                const auto maximum_y = std::max(0,
-                                    static_cast<int>(client.bottom) -
-                                        panel->window.height);
-                                state->position_y = std::clamp(
+                                for (auto& other : host->container_panel_states) {
+                                    if (other.id != state->id) other.position_y = -1;
+                                }
+                                const auto group_height =
+                                    container_panel_group_available_height(
+                                        *host, window, *game_layout);
+                                const auto minimum_y = game_layout->sidebar.y +
+                                    game_layout->sidebar.height - group_height;
+                                const auto requested_y =
                                     host->container_move_start_position_y +
                                         static_cast<int>(host->mouse.y) -
-                                        host->container_move_start_y,
-                                    0, maximum_y);
+                                        host->container_move_start_y;
+                                const auto moved_y =
+                                    tibia::client::container_panel_move_y(
+                                        requested_y, minimum_y, group_height,
+                                        panel->window.height);
+                                state->position_y = moved_y;
+                                tibia::client::reorder_container_panel_after_move(
+                                    host->container_panel_states,
+                                    static_cast<std::uint8_t>(
+                                        host->moving_container_id),
+                                    moved_y, minimum_y);
                                 InvalidateRect(window, nullptr, FALSE);
                             }
                         }
@@ -9938,13 +11869,65 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                                 });
                             if (panel != panels.end() && state !=
                                     host->container_panel_states.end()) {
-                                state->height = std::clamp(
+                                const auto previous_height = panel->window.height;
+                                const auto requested_height =
                                     host->container_resize_start_height +
-                                        static_cast<int>(host->mouse.y) -
-                                        host->container_resize_start_y,
+                                    static_cast<int>(host->mouse.y) -
+                                    host->container_resize_start_y;
+                                const auto container = std::find_if(
+                                    snapshot->containers.begin(),
+                                    snapshot->containers.end(), [host](const auto& item) {
+                                        return item.id == host->resizing_container_id;
+                                    });
+                                const auto item_count = container ==
+                                        snapshot->containers.end()
+                                    ? 0 : container->items.size();
+                                state->height = std::max(
                                     tibia::client::container_panel_minimum_height,
-                                    panel->maximum_height);
+                                    tibia::client::container_panel_resize_height(
+                                        previous_height, requested_height, item_count));
                                 state->restore_height = state->height;
+                                tibia::client::adjust_container_panel_group_after_resize(
+                                    host->container_panel_states,
+                                    snapshot->containers, state->id,
+                                    previous_height, state->height,
+                                    container_panel_group_available_height(
+                                        *host, window, *game_layout));
+                                InvalidateRect(window, nullptr, FALSE);
+                            }
+                        }
+                    }
+                }
+                if (host->container_scrollbar_dragging && host->dragging) {
+                    RECT client{};
+                    if (GetClientRect(window, &client)) {
+                        const auto snapshot = host->game_world_mailbox->read();
+                        const auto game_layout = tibia::client::resolve_game_window_layout({
+                            client.right - client.left, client.bottom - client.top,
+                            host->console_height, tibia::client::map_panel_height,
+                            tibia::client::map_window_minimum_height,
+                            host->no_stretching});
+                        if (snapshot && game_layout) {
+                            const auto panels = container_panel_layouts(*host, window,
+                                *snapshot, *game_layout);
+                            const auto panel = std::find_if(panels.begin(), panels.end(),
+                                [host](const auto& item) {
+                                    return item.id == host->pressed_container_scroll_id;
+                                });
+                            const auto state = std::find_if(
+                                host->container_panel_states.begin(),
+                                host->container_panel_states.end(), [host](const auto& item) {
+                                    return item.id == host->pressed_container_scroll_id;
+                                });
+                            if (panel != panels.end() && state !=
+                                    host->container_panel_states.end()) {
+                                state->scroll_value =
+                                    tibia::client::container_panel_scroll_after_thumb_drag(
+                                        host->mouse.y,
+                                        host->container_scrollbar_grab_offset,
+                                        panel->scroll_track,
+                                        panel->scroll_thumb.height,
+                                        panel->scroll_range);
                                 InvalidateRect(window, nullptr, FALSE);
                             }
                         }
@@ -10034,6 +12017,26 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     host->hints.size(), visible);
                 InvalidateRect(window, nullptr, FALSE);
             }
+            if (host->character_scrollbar_dragging && host->dragging &&
+                host->screen == UiScreen::character_selection) {
+                const auto list = character_list_rect(window,
+                    host->character_selection_dialog_offset);
+                const int margin = ui_units(window, 3);
+                const int row_height = ui_units(window,
+                    std::max(1, host->ui_font_heights[3]));
+                const int visible = std::max(1,
+                    (static_cast<int>(list.bottom - list.top) - 2 * margin) /
+                        row_height);
+                const auto geometry = options_list_scrollbar_geometry(window,
+                    list, host->characters.size(), visible,
+                    host->character_list_scroll);
+                host->character_list_scroll =
+                    tibia::client::ui_scrollbar_scroll_after_thumb_drag(
+                        host->mouse.y - list.top,
+                        host->character_scrollbar_grab_offset, geometry,
+                        host->characters.size(), visible);
+                InvalidateRect(window, nullptr, FALSE);
+            }
             if (host->hint_content_scroll_dragging && host->dragging) {
                 const auto view = hint_content_view_rect(window,
                     host->hint_content_dialog_offset);
@@ -10099,6 +12102,18 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     geometry, host->available_channels.size(), visible_rows);
                 InvalidateRect(window, nullptr, FALSE);
             }
+            if (host->vip_edit_dialog_open &&
+                host->vip_edit_scrollbar_dragging && host->dragging) {
+                const auto scroll = vip_edit_description_scroll_plan(*host,
+                    host->vip_edit_dialog_offset);
+                host->vip_edit_description_scroll =
+                    tibia::client::ui_scrollbar_scroll_after_thumb_drag(
+                        host->mouse.y - scroll.field.top,
+                        host->vip_edit_scrollbar_grab_offset,
+                        scroll.scrollbar, scroll.lines.size(),
+                        scroll.visible_lines);
+                InvalidateRect(window, nullptr, FALSE);
+            }
             if (host->dragged_dialog != ClientHost::DraggedDialog::none && host->dragging) {
                 RECT base{};
                 POINT* offset{};
@@ -10135,6 +12150,12 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 } else if (host->dragged_dialog == ClientHost::DraggedDialog::new_channel) {
                     base = new_channel_dialog_rect(*host);
                     offset = &host->new_channel_dialog_offset;
+                } else if (host->dragged_dialog == ClientHost::DraggedDialog::vip_add) {
+                    base = vip_add_dialog_rect(*host);
+                    offset = &host->vip_add_dialog_offset;
+                } else if (host->dragged_dialog == ClientHost::DraggedDialog::vip_edit) {
+                    base = vip_edit_dialog_rect(*host);
+                    offset = &host->vip_edit_dialog_offset;
                 } else if (host->dragged_dialog == ClientHost::DraggedDialog::motd) {
                     base = motd_dialog_rect(*host);
                     offset = &host->motd_dialog_offset;
@@ -10162,6 +12183,9 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 } else if (host->dragged_dialog == ClientHost::DraggedDialog::quest_line) {
                     base = quest_line_dialog_rect(window);
                     offset = &host->quest_line_dialog_offset;
+                } else if (host->dragged_dialog == ClientHost::DraggedDialog::move_item) {
+                    base = move_item_dialog_rect(*host);
+                    offset = &host->move_item_dialog_offset;
                 } else {
                     base = info_dialog_rect(window);
                     offset = &host->info_dialog_offset;
@@ -10186,8 +12210,9 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
         if (host) {
             const bool notice_open = !host->notice_text.empty();
             const bool modal_open = !host->connection_status_text.empty() ||
-                notice_open || host->motd_open ||
+                notice_open || host->move_item_dialog.has_value() || host->motd_open ||
                 host->account_data_warning_open || host->new_channel_dialog_open ||
+                host->vip_add_dialog_open || host->vip_edit_dialog_open ||
                 host->help_open ||
                 host->hints_open || host->hint_content_open ||
                 host->rule_violation_request_form.open ||
@@ -10195,6 +12220,163 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 host->quest_log_open || host->quest_line_open;
             const POINT mouse{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             host->mouse = mouse;
+            if (host->move_item_dialog) {
+                if (message == WM_LBUTTONDOWN) {
+                    RECT client{};
+                    GetClientRect(window, &client);
+                    const auto layout = tibia::client::resolve_move_item_dialog_layout(
+                        client.right - client.left, client.bottom - client.top,
+                        ui_units(window, 1), host->move_item_dialog_offset.x,
+                        host->move_item_dialog_offset.y);
+                    const auto rect = [](const tibia::client::ContentWindowRect& value) {
+                        return RECT{value.x, value.y, value.x + value.width,
+                            value.y + value.height};
+                    };
+                    host->pressed_move_item_button = -1;
+                    host->pressed_move_item_control = -1;
+                    host->move_item_control_dragging = false;
+                    if (contains_point(rect(layout.ok_button), mouse))
+                        host->pressed_move_item_button = 0;
+                    else if (contains_point(rect(layout.cancel_button), mouse))
+                        host->pressed_move_item_button = 1;
+                    const auto slider = rect(layout.amount_field);
+                    if (contains_point(slider, mouse)) {
+                        const auto thumb = move_item_range_thumb(*host, slider);
+                        if (mouse.x < slider.left + ui_units(window, 12))
+                            host->pressed_move_item_control = 0;
+                        else if (mouse.x >= slider.right - ui_units(window, 12))
+                            host->pressed_move_item_control = 1;
+                        else {
+                            host->pressed_move_item_control = 2;
+                            if (contains_point(thumb, mouse)) {
+                                host->move_item_control_dragging = true;
+                                host->move_item_thumb_grab_offset = mouse.x - thumb.left;
+                            } else {
+                                const int amount = host->move_item_dialog->amount +
+                                    (mouse.x < thumb.left ? -1 : 1);
+                                (void)tibia::client::set_move_item_dialog_amount(
+                                    *host->move_item_dialog, static_cast<std::uint8_t>(
+                                        std::clamp(amount, 1, static_cast<int>(
+                                            host->move_item_dialog->maximum_amount))));
+                            }
+                        }
+                    } else if (mouse.x >= layout.dialog.x &&
+                        mouse.x < layout.dialog.x + layout.dialog.width &&
+                        mouse.y >= layout.dialog.y &&
+                        mouse.y < layout.dialog.y + ui_units(window, 17)) {
+                        host->dragged_dialog = ClientHost::DraggedDialog::move_item;
+                        host->dialog_drag_anchor = mouse;
+                        host->dialog_drag_start_offset = host->move_item_dialog_offset;
+                    }
+                    host->mouse_buttons |= 1U;
+                    SetFocus(window);
+                    SetCapture(window);
+                    InvalidateRect(window, nullptr, FALSE);
+                    return 0;
+                }
+                return 0;
+            }
+            if (message == WM_LBUTTONDOWN && host->vip_edit_dialog_open) {
+                const auto layout = vip_edit_layout(*host,
+                    host->vip_edit_dialog_offset);
+                const auto dialog = vip_edit_native_rect(layout.dialog);
+                const auto scroll = vip_edit_description_scroll_plan(*host,
+                    host->vip_edit_dialog_offset);
+                const auto field = scroll.field;
+                const auto notify = vip_edit_native_rect(layout.notify_checkbox);
+                const auto scrollbar_child = vip_edit_scrollbar_part_rect(scroll,
+                    {scroll.scrollbar.up_arrow.left, scroll.scrollbar.up_arrow.top,
+                        scroll.scrollbar.down_arrow.right,
+                        scroll.scrollbar.down_arrow.bottom});
+                if (!contains_point(scrollbar_child, mouse))
+                    host->vip_edit_description_focused = contains_point(field, mouse);
+                host->pressed_vip_edit_button = -1;
+                host->pressed_vip_edit_type = -1;
+                host->pressed_vip_edit_notify = contains_point(notify, mouse);
+                host->pressed_vip_edit_scroll_part = -1;
+                host->vip_edit_scrollbar_dragging = false;
+                const auto up = vip_edit_scrollbar_part_rect(scroll,
+                    scroll.scrollbar.up_arrow);
+                const auto down = vip_edit_scrollbar_part_rect(scroll,
+                    scroll.scrollbar.down_arrow);
+                const auto track = vip_edit_scrollbar_part_rect(scroll,
+                    scroll.scrollbar.track);
+                const auto thumb = vip_edit_scrollbar_part_rect(scroll,
+                    scroll.scrollbar.thumb);
+                if (contains_point(up, mouse))
+                    host->pressed_vip_edit_scroll_part = 0;
+                else if (contains_point(down, mouse))
+                    host->pressed_vip_edit_scroll_part = 1;
+                else if (scroll.scrollbar.thumb_visible &&
+                    contains_point(thumb, mouse)) {
+                    host->pressed_vip_edit_scroll_part = 2;
+                    host->vip_edit_scrollbar_dragging = true;
+                    host->vip_edit_scrollbar_grab_offset = mouse.y - thumb.top;
+                } else if (contains_point(track, mouse)) {
+                    host->pressed_vip_edit_scroll_part = 3;
+                }
+                for (int index = 0; index < 2; ++index)
+                    if (contains_point(vip_edit_button_rect(*host, index), mouse))
+                        host->pressed_vip_edit_button = index;
+                for (std::size_t index = 0; index < layout.type_buttons.size(); ++index)
+                    if (contains_point(vip_edit_native_rect(layout.type_buttons[index]), mouse))
+                        host->pressed_vip_edit_type = static_cast<int>(index);
+                if (mouse.x >= dialog.left && mouse.x < dialog.right &&
+                    mouse.y >= dialog.top &&
+                    mouse.y < dialog.top + ui_units(window, 17)) {
+                    host->dragged_dialog = ClientHost::DraggedDialog::vip_edit;
+                    host->dialog_drag_anchor = mouse;
+                    host->dialog_drag_start_offset = host->vip_edit_dialog_offset;
+                }
+                host->mouse_buttons |= 1U;
+                SetFocus(window);
+                SetCapture(window);
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+            if (message == WM_LBUTTONDOWN && host->vip_add_dialog_open) {
+                const auto layout = vip_add_layout(*host,
+                    host->vip_add_dialog_offset);
+                const auto dialog = vip_add_native_rect(layout.dialog);
+                const auto field = vip_add_native_rect(layout.name_field);
+                host->vip_add_name_focused = contains_point(field, mouse);
+                host->pressed_vip_add_button = -1;
+                for (int index = 0; index < 2; ++index)
+                    if (contains_point(vip_add_button_rect(*host, index), mouse))
+                        host->pressed_vip_add_button = index;
+                if (mouse.x >= dialog.left && mouse.x < dialog.right &&
+                    mouse.y >= dialog.top &&
+                    mouse.y < dialog.top + ui_units(window, 17)) {
+                    host->dragged_dialog = ClientHost::DraggedDialog::vip_add;
+                    host->dialog_drag_anchor = mouse;
+                    host->dialog_drag_start_offset = host->vip_add_dialog_offset;
+                }
+                SetFocus(window);
+                SetCapture(window);
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+            if (host->container_item_context_menu) {
+                if (message == WM_LBUTTONDOWN) {
+                    const auto* option = container_item_context_option_at(
+                        *host, mouse);
+                    host->pressed_container_item_context_action = option
+                        ? static_cast<int>(option->action) : -1;
+                    if (option) {
+                        SetCapture(window);
+                        host->mouse_buttons |= 1U;
+                    } else {
+                        host->container_item_context_menu.reset();
+                    }
+                    InvalidateRect(window, nullptr, FALSE);
+                    if (option) return 0;
+                } else if (message == WM_RBUTTONDOWN) {
+                    host->container_item_context_menu.reset();
+                    host->pressed_container_item_context_action = -1;
+                    InvalidateRect(window, nullptr, FALSE);
+                    return 0;
+                }
+            }
             if (host->battle_context_menu) {
                 if (message == WM_LBUTTONDOWN) {
                     const auto* entry = battle_menu_entry_at(*host, mouse);
@@ -10325,9 +12507,37 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                             bounds.x + bounds.width, bounds.y + bounds.height};
                     };
                     for (auto panel = panels.rbegin(); panel != panels.rend(); ++panel) {
-                        if (contains_point(as_rect(panel->minimize_button), mouse)) {
+                        if (!contains_point(as_rect(panel->window), mouse))
+                            continue;
+                        if (panel->scrollable && contains_point(
+                                as_rect(panel->scroll_thumb), mouse)) {
+                            host->pressed_container_scroll_id = panel->id;
+                            host->pressed_container_scroll_part = 2;
+                            host->container_scrollbar_dragging = true;
+                            host->container_scrollbar_grab_offset = mouse.y -
+                                panel->scroll_thumb.y;
+                        } else if (panel->scrollable && contains_point(
+                                as_rect(panel->scroll_buttons[0]), mouse)) {
+                            host->pressed_container_scroll_id = panel->id;
+                            host->pressed_container_scroll_part = 0;
+                        } else if (panel->scrollable && contains_point(
+                                as_rect(panel->scroll_buttons[1]), mouse)) {
+                            host->pressed_container_scroll_id = panel->id;
+                            host->pressed_container_scroll_part = 1;
+                        } else if (panel->scrollable && contains_point(
+                                as_rect(panel->scroll_track), mouse)) {
+                            host->pressed_container_scroll_id = panel->id;
+                            host->pressed_container_scroll_part = 3;
+                        } else if (panel->has_parent &&
+                            contains_point(as_rect(panel->higher_button), mouse)) {
+                            host->pressed_container_header_id = panel->id;
+                            host->pressed_container_header_button = 3;
+                        } else if (contains_point(as_rect(panel->minimize_button), mouse)) {
                             host->pressed_container_header_id = panel->id;
                             host->pressed_container_header_button = 1;
+                        } else if (contains_point(as_rect(panel->close_button), mouse)) {
+                            host->pressed_container_header_id = panel->id;
+                            host->pressed_container_header_button = 2;
                         } else if (!panel->minimized &&
                             (contains_point(as_rect(panel->resize_hit_area), mouse) ||
                                 contains_point(as_rect(panel->resize_grip), mouse))) {
@@ -10344,7 +12554,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                                 state->z_order = ++host->next_container_z_order;
                         } else if (contains_point(as_rect(panel->frame.title_bar), mouse)) {
                             const bool on_control =
-                                contains_point(as_rect(panel->higher_button), mouse) ||
+                                (panel->has_parent && contains_point(
+                                    as_rect(panel->higher_button), mouse)) ||
                                 contains_point(as_rect(panel->minimize_button), mouse) ||
                                 contains_point(as_rect(panel->close_button), mouse);
                             if (!on_control) {
@@ -10361,7 +12572,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                                     state->z_order = ++host->next_container_z_order;
                             }
                         }
-                        if (host->pressed_container_header_id >= 0 ||
+                        if (host->pressed_container_scroll_id >= 0 ||
+                            host->pressed_container_header_id >= 0 ||
                             host->resizing_container_id >= 0 ||
                             host->moving_container_id >= 0) {
                             SetCapture(window);
@@ -10369,6 +12581,21 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                             InvalidateRect(window, nullptr, FALSE);
                             return 0;
                         }
+                        if (host->interaction_mode ==
+                                tibia::client::GameInteractionMode::none &&
+                            contains_point(as_rect(panel->item_viewport), mouse)) {
+                            const auto hit = tibia::client::container_item_at(
+                                panels, snapshot->containers, mouse.x, mouse.y);
+                            if (hit) {
+                                const auto container_y = static_cast<std::uint16_t>(
+                                    hit->container_id + 0x40U);
+                                begin_move_item_drag(*host, window,
+                                    {0xffff, container_y, hit->slot,
+                                        hit->item_type, hit->slot},
+                                    hit->has_extra ? hit->extra : 1, mouse);
+                            }
+                        }
+                        return 0;
                     }
                 }
             }
@@ -10469,14 +12696,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     host->vip_scrollbar_dragging = false;
                     if (contains_point(rect_for(geometry.up_arrow), mouse)) {
                         host->pressed_vip_scrollbar_part = 0;
-                        host->vip_scroll_value =
-                            tibia::client::skills_panel_scroll_by_lines(
-                                plan->scroll, -1);
                     } else if (contains_point(rect_for(geometry.down_arrow), mouse)) {
                         host->pressed_vip_scrollbar_part = 1;
-                        host->vip_scroll_value =
-                            tibia::client::skills_panel_scroll_by_lines(
-                                plan->scroll, 1);
                     } else if (geometry.thumb_visible &&
                         contains_point(rect_for(geometry.thumb), mouse)) {
                         host->vip_scrollbar_dragging = true;
@@ -10491,6 +12712,7 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     if (host->pressed_vip_scrollbar_part >= 0 ||
                         host->vip_scrollbar_dragging) {
                         SetCapture(window);
+                        host->mouse_buttons |= 1U;
                         InvalidateRect(window, nullptr, FALSE);
                         return 0;
                     }
@@ -10525,14 +12747,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     host->skills_scrollbar_dragging = false;
                     if (contains_point(rect_for(geometry.up_arrow), mouse)) {
                         host->pressed_skills_scrollbar_part = 0;
-                        host->skills_scroll_value =
-                            tibia::client::skills_panel_scroll_by_lines(
-                                plan->skills.scroll_range, -1);
                     } else if (contains_point(rect_for(geometry.down_arrow), mouse)) {
                         host->pressed_skills_scrollbar_part = 1;
-                        host->skills_scroll_value =
-                            tibia::client::skills_panel_scroll_by_lines(
-                                plan->skills.scroll_range, 1);
                     } else if (geometry.thumb_visible &&
                         contains_point(rect_for(geometry.thumb), mouse)) {
                         host->skills_scrollbar_dragging = true;
@@ -10541,14 +12757,13 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     } else if (geometry.thumb_visible &&
                         contains_point(rect_for(geometry.track), mouse)) {
                         host->pressed_skills_scrollbar_part = 2;
-                        host->skills_scroll_value =
-                            tibia::client::skills_panel_scroll_after_track_click(
-                                plan->skills.scroll_range, geometry, mouse.y);
                     }
                     if (host->pressed_skills_scrollbar_part >= 0 ||
                         host->skills_scrollbar_dragging) {
                         SetCapture(window);
+                        host->mouse_buttons |= 1U;
                         InvalidateRect(window, nullptr, FALSE);
+                        return 0;
                     }
                 }
             }
@@ -10564,15 +12779,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     host->battle_scrollbar_dragging = false;
                     if (contains_point(rect_for(geometry.up_arrow), mouse)) {
                         host->pressed_battle_scrollbar_part = 0;
-                        host->battle_scroll_value = std::max(0,
-                            plan->panel.scroll_offset -
-                                tibia::client::battle_panel_scroll_step);
                     } else if (contains_point(rect_for(geometry.down_arrow), mouse)) {
                         host->pressed_battle_scrollbar_part = 1;
-                        host->battle_scroll_value = std::min(
-                            plan->panel.scroll_range,
-                            plan->panel.scroll_offset +
-                                tibia::client::battle_panel_scroll_step);
                     } else if (geometry.thumb_visible &&
                         contains_point(rect_for(geometry.thumb), mouse)) {
                         host->battle_scrollbar_dragging = true;
@@ -10581,20 +12789,11 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     } else if (geometry.thumb_visible &&
                         contains_point(rect_for(geometry.track), mouse)) {
                         host->pressed_battle_scrollbar_part = 2;
-                        const auto page = std::max(0,
-                            plan->panel.viewport.height -
-                                tibia::client::battle_panel_row_height);
-                        if (mouse.y < geometry.thumb.y)
-                            host->battle_scroll_value = std::max(0,
-                                plan->panel.scroll_offset - page);
-                        else
-                            host->battle_scroll_value = std::min(
-                                plan->panel.scroll_range,
-                                plan->panel.scroll_offset + page);
                     }
                     if (host->pressed_battle_scrollbar_part >= 0 ||
                         host->battle_scrollbar_dragging) {
                         SetCapture(window);
+                        host->mouse_buttons |= 1U;
                         InvalidateRect(window, nullptr, FALSE);
                         return 0;
                     }
@@ -10855,13 +13054,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     const auto track = options_list_scrollbar_part_rect(list,
                         geometry.track);
                     if (contains_point(up, mouse)) {
-                        host->new_channel_scroll = std::max(0,
-                            host->new_channel_scroll - 1);
                         host->pressed_new_channel_scroll_button = 0;
                     } else if (contains_point(down, mouse)) {
-                        host->new_channel_scroll = std::min(
-                            std::max(0, static_cast<int>(host->available_channels.size()) -
-                                visible_rows), host->new_channel_scroll + 1);
                         host->pressed_new_channel_scroll_button = 1;
                     } else if (geometry.thumb_visible && contains_point(track, mouse) &&
                         contains_point(options_list_scrollbar_part_rect(list,
@@ -10870,10 +13064,7 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                         host->new_channel_scrollbar_grab_offset = mouse.y - list.top -
                             geometry.thumb.top;
                     } else if (contains_point(track, mouse)) {
-                        host->new_channel_scroll =
-                            tibia::client::ui_scrollbar_scroll_after_track_click(
-                                mouse.y - list.top, geometry, host->new_channel_scroll,
-                                host->available_channels.size(), visible_rows);
+                        host->pressed_new_channel_scroll_button = 2;
                     } else {
                         const int row = (mouse.y - list.top - margin) / row_height;
                         const int index = host->new_channel_scroll + row;
@@ -11056,21 +13247,14 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 host->pressed_hint_content_scroll_part = -1;
                 if (contains_point(up, mouse)) {
                     host->pressed_hint_content_scroll_part = 0;
-                    host->hint_content_scroll = std::max(0, host->hint_content_scroll - 1);
                 } else if (contains_point(down, mouse)) {
                     host->pressed_hint_content_scroll_part = 1;
-                    host->hint_content_scroll = std::min(
-                        std::max(0, static_cast<int>(host->hint_content_lines.size()) - visible),
-                        host->hint_content_scroll + 1);
                 } else if (geometry.thumb_visible && contains_point(
                     options_list_scrollbar_part_rect(view, geometry.thumb), mouse)) {
                     host->hint_content_scroll_dragging = true;
                     host->hint_content_scroll_grab_offset =
                         mouse.y - view.top - geometry.thumb.top;
                 } else if (geometry.thumb_visible && contains_point(track, mouse)) {
-                    host->hint_content_scroll = tibia::client::ui_scrollbar_scroll_after_track_click(
-                        mouse.y - view.top, geometry, host->hint_content_scroll,
-                        host->hint_content_lines.size(), visible);
                     host->pressed_hint_content_scroll_part = 2;
                 }
                 if (mouse.x >= dialog.left && mouse.x < dialog.right &&
@@ -11111,21 +13295,14 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 host->pressed_hints_scroll_part = -1;
                 if (contains_point(up, mouse)) {
                     host->pressed_hints_scroll_part = 0;
-                    host->hints_scroll = std::max(0, host->hints_scroll - 1);
                 } else if (contains_point(down, mouse)) {
                     host->pressed_hints_scroll_part = 1;
-                    host->hints_scroll = std::min(
-                        std::max(0, static_cast<int>(host->hints.size()) - visible),
-                        host->hints_scroll + 1);
                 } else if (geometry.thumb_visible && contains_point(
                     options_list_scrollbar_part_rect(list, geometry.thumb), mouse)) {
                     host->hints_scroll_dragging = true;
                     host->hints_scroll_grab_offset =
                         mouse.y - list.top - geometry.thumb.top;
                 } else if (geometry.thumb_visible && contains_point(track, mouse)) {
-                    host->hints_scroll = tibia::client::ui_scrollbar_scroll_after_track_click(
-                        mouse.y - list.top, geometry, host->hints_scroll,
-                        host->hints.size(), visible);
                     host->pressed_hints_scroll_part = 2;
                 }
                 if (mouse.x >= dialog.left && mouse.x < dialog.right &&
@@ -11540,19 +13717,19 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     const auto up = options_list_scrollbar_part_rect(list, geometry.up_arrow);
                     const auto down = options_list_scrollbar_part_rect(list, geometry.down_arrow);
                     const auto track = options_list_scrollbar_part_rect(list, geometry.track);
-                    const int maximum = std::max(0,
-                        static_cast<int>(host->characters.size()) - visible_rows);
+                    host->character_scrollbar_dragging = false;
                     if (contains_point(up, host->mouse)) {
                         host->pressed_character_scroll_button = 0;
-                        host->character_list_scroll = std::max(0, host->character_list_scroll - 1);
                     } else if (contains_point(down, host->mouse)) {
                         host->pressed_character_scroll_button = 1;
-                        host->character_list_scroll = std::min(maximum, host->character_list_scroll + 1);
+                    } else if (geometry.thumb_visible && contains_point(
+                        options_list_scrollbar_part_rect(list, geometry.thumb),
+                        host->mouse)) {
+                        host->character_scrollbar_dragging = true;
+                        host->character_scrollbar_grab_offset = host->mouse.y -
+                            list.top - geometry.thumb.top;
                     } else if (geometry.thumb_visible && contains_point(track, host->mouse)) {
-                        const int first = tibia::client::ui_scrollbar_scroll_after_track_click(
-                            host->mouse.y - list.top, geometry, host->character_list_scroll,
-                            host->characters.size(), visible_rows);
-                        host->character_list_scroll = std::clamp(first, 0, maximum);
+                        host->pressed_character_scroll_button = 2;
                     } else if (visible_row >= 0 && visible_row < visible_rows && row >= 0 &&
                         static_cast<std::size_t>(row) < host->characters.size()) {
                         host->selected_character = row;
@@ -11625,6 +13802,10 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     host->console_height, tibia::client::map_panel_height, tibia::client::map_window_minimum_height,
                     host->no_stretching});
                 if (layout) {
+                    if (begin_inventory_move_item_drag(*host, window, mouse))
+                        return 0;
+                    if (begin_map_move_item_drag(*host, window, mouse))
+                        return 0;
                     const auto console_separator_y = layout->console.y;
                     if (mouse.x >= layout->console.x &&
                         mouse.x < layout->console.x + layout->console.width &&
@@ -11770,6 +13951,63 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
     case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP:
         if (host) {
             host->mouse = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            if (host->move_item_dialog) {
+                if (message == WM_LBUTTONUP) {
+                    RECT client{};
+                    GetClientRect(window, &client);
+                    const auto layout = tibia::client::resolve_move_item_dialog_layout(
+                        client.right - client.left, client.bottom - client.top,
+                        ui_units(window, 1), host->move_item_dialog_offset.x,
+                        host->move_item_dialog_offset.y);
+                    const auto rect = [](const tibia::client::ContentWindowRect& value) {
+                        return RECT{value.x, value.y, value.x + value.width,
+                            value.y + value.height};
+                    };
+                    const int pressed = host->pressed_move_item_button;
+                    const int range_control = host->pressed_move_item_control;
+                    const auto slider = rect(layout.amount_field);
+                    if (range_control == 2 && host->move_item_control_dragging) {
+                        const int amount = move_item_amount_from_pointer(*host, slider,
+                            host->mouse.x - host->move_item_thumb_grab_offset);
+                        (void)tibia::client::set_move_item_dialog_amount(
+                            *host->move_item_dialog, static_cast<std::uint8_t>(amount));
+                    }
+                    host->pressed_move_item_button = -1;
+                    if (range_control == 0 && contains_point({slider.left, slider.top,
+                            slider.left + ui_units(window, 12), slider.bottom}, host->mouse)) {
+                        const int amount = std::max(1,
+                            static_cast<int>(host->move_item_dialog->amount) - 1);
+                        (void)tibia::client::set_move_item_dialog_amount(
+                            *host->move_item_dialog, static_cast<std::uint8_t>(amount));
+                    } else if (range_control == 1 && contains_point({
+                        slider.right - ui_units(window, 12), slider.top,
+                        slider.right, slider.bottom}, host->mouse)) {
+                        const int amount = std::min(
+                            static_cast<int>(host->move_item_dialog->maximum_amount),
+                            static_cast<int>(host->move_item_dialog->amount) + 1);
+                        (void)tibia::client::set_move_item_dialog_amount(
+                            *host->move_item_dialog, static_cast<std::uint8_t>(amount));
+                    }
+                    host->pressed_move_item_control = -1;
+                    host->move_item_control_dragging = false;
+                    host->dragged_dialog = ClientHost::DraggedDialog::none;
+                    if (pressed == 0 && contains_point(rect(layout.ok_button), host->mouse))
+                        (void)submit_move_item_dialog(*host);
+                    else if (pressed == 1 &&
+                        contains_point(rect(layout.cancel_button), host->mouse))
+                        cancel_move_item_dialog(*host);
+                }
+                host->mouse_buttons &= message == WM_LBUTTONUP ? ~1U :
+                    message == WM_RBUTTONUP ? ~2U : ~4U;
+                if (!host->mouse_buttons) ReleaseCapture();
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+            if (message == WM_LBUTTONUP && host->pending_move_item_source &&
+                !host->move_item_dragging) {
+                host->pending_move_item_source.reset();
+                host->pending_move_item_count = 1;
+            }
             const bool automap_modal_open = !host->connection_status_text.empty() ||
                 !host->notice_text.empty() || host->motd_open ||
                 host->account_data_warning_open || host->new_channel_dialog_open ||
@@ -11777,6 +14015,21 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 host->rule_violation_request_form.open ||
                 host->report_violation_dialog.open || host->quest_log_open ||
                 host->quest_line_open;
+            if (message == WM_LBUTTONUP && !automap_modal_open &&
+                host->screen == UiScreen::game_world &&
+                send_move_item_drop(*host, window, host->mouse)) {
+                host->mouse_buttons &= ~1U;
+                if (!host->mouse_buttons) ReleaseCapture();
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+            if (message == WM_RBUTTONUP && !automap_modal_open &&
+                (host->mouse_buttons & 2U) != 0 &&
+                host->screen == UiScreen::game_world) {
+                if (!send_container_item_action(*host, window,
+                        host->mouse.x, host->mouse.y))
+                    (void)send_inventory_item_action(*host, window, host->mouse);
+            }
             if (message == WM_LBUTTONUP && host->console_resize_dragging) {
                 host->console_resize_dragging = false;
                 save_console_height(*host);
@@ -11879,6 +14132,27 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 return 0;
             }
             if (message == WM_LBUTTONUP &&
+                host->pressed_container_item_context_action >= 0) {
+                const auto pressed = static_cast<
+                    tibia::client::ContainerItemContextAction>(
+                        host->pressed_container_item_context_action);
+                const auto* option = container_item_context_option_at(*host,
+                    host->mouse);
+                const bool selected = option && option->action == pressed;
+                const auto hit = host->container_item_context_hit;
+                host->pressed_container_item_context_action = -1;
+                host->container_item_context_menu.reset();
+                host->mouse_buttons &= ~1U;
+                if (!host->mouse_buttons) ReleaseCapture();
+                if (selected)
+                    (void)apply_container_item_context_action(*host, window,
+                        pressed, hit);
+                host->container_item_context_position.reset();
+                host->container_item_context_from_inventory = false;
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+            if (message == WM_LBUTTONUP &&
                 host->pressed_console_context_menu_action >= 0) {
                 const auto pressed = static_cast<
                     tibia::client::ConsoleContextMenuAction>(
@@ -11965,22 +14239,132 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                         host->container_panel_states.end(), [id](const auto& item) {
                             return item.id == id;
                         });
-                    if (panel != panels.end() && state !=
-                            host->container_panel_states.end() && button == 1) {
-                        const auto& bounds = panel->minimize_button;
-                        if (contains_point(RECT{bounds.x, bounds.y,
-                                bounds.x + bounds.width, bounds.y + bounds.height},
-                                host->mouse)) {
-                            if (!state->minimized) {
-                                state->restore_height = panel->window.height;
-                                state->height = panel->window.height;
-                                state->minimized = true;
-                            } else {
-                                state->minimized = false;
-                                state->height = std::max(
-                                    tibia::client::container_panel_minimum_height,
-                                    state->restore_height);
+                    if (panel != panels.end() && (button == 3
+                            ? panel->has_parent
+                            : state != host->container_panel_states.end())) {
+                        const auto& bounds = button == 1 ? panel->minimize_button
+                            : button == 2 ? panel->close_button : panel->higher_button;
+                        if ((button == 1 || button == 2 || button == 3) && contains_point(
+                                RECT{bounds.x, bounds.y,
+                                    bounds.x + bounds.width,
+                                    bounds.y + bounds.height}, host->mouse)) {
+                            if (button == 3 && host->send_game_payload) {
+                                try {
+                                    const auto request =
+                                        tibia::network::encode_container_higher_request(id);
+                                    host->send_game_payload(request);
+                                    state->higher_navigation_pending = true;
+                                } catch (const std::exception& error) {
+                                    host->notice_text = error_to_wide(error.what());
+                                }
+                            } else if (button == 2 && host->send_game_payload) {
+                                try {
+                                    const auto request =
+                                        tibia::network::encode_container_close_request(id);
+                                    host->send_game_payload(request);
+                                    state->attached = false;
+                                    state->position_y = -1;
+                                    tibia::client::fit_container_panel_group_after_close(
+                                        host->container_panel_states,
+                                        snapshot->containers,
+                                        container_panel_group_available_height(
+                                            *host, window, *game_layout));
+                                } catch (const std::exception& error) {
+                                    host->notice_text = error_to_wide(error.what());
+                                }
+                            } else if (button == 1) {
+                                const auto previous_height = panel->window.height;
+                                if (!state->minimized) {
+                                    state->restore_height = panel->window.height;
+                                    state->height = panel->window.height;
+                                    state->minimized = true;
+                                } else {
+                                    state->minimized = false;
+                                    const auto container = std::find_if(
+                                        snapshot->containers.begin(),
+                                        snapshot->containers.end(), [id](const auto& item) {
+                                            return item.id == id;
+                                        });
+                                    const auto item_count = container ==
+                                            snapshot->containers.end()
+                                        ? 0 : container->items.size();
+                                    state->height = std::max(
+                                        tibia::client::container_panel_minimum_height,
+                                        tibia::client::container_panel_resize_height(
+                                            panel->window.height, state->restore_height,
+                                            item_count));
+                                }
+                                const auto new_height = state->minimized
+                                    ? tibia::client::container_panel_minimized_height
+                                    : std::max(state->height,
+                                        tibia::client::container_panel_minimum_height);
+                                state->height = new_height;
+                                tibia::client::adjust_container_panel_group_after_resize(
+                                    host->container_panel_states, snapshot->containers,
+                                    id, previous_height,
+                                    new_height, container_panel_group_available_height(
+                                        *host, window, *game_layout));
                             }
+                        }
+                    }
+                }
+                host->mouse_buttons &= ~1U;
+                if (!host->mouse_buttons) ReleaseCapture();
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+            if (message == WM_LBUTTONUP &&
+                host->pressed_container_scroll_id >= 0) {
+                const auto id = static_cast<std::uint8_t>(
+                    host->pressed_container_scroll_id);
+                const auto part = host->pressed_container_scroll_part;
+                host->pressed_container_scroll_id = -1;
+                host->pressed_container_scroll_part = -1;
+                host->container_scrollbar_dragging = false;
+                RECT client{};
+                GetClientRect(window, &client);
+                const auto snapshot = host->game_world_mailbox->read();
+                const auto game_layout = tibia::client::resolve_game_window_layout({
+                    client.right - client.left, client.bottom - client.top,
+                    host->console_height, tibia::client::map_panel_height,
+                    tibia::client::map_window_minimum_height,
+                    host->no_stretching});
+                if (snapshot && game_layout && (part < 2 || part == 3)) {
+                    const auto panels = container_panel_layouts(*host, window,
+                        *snapshot, *game_layout);
+                    const auto panel = std::find_if(panels.begin(), panels.end(),
+                        [id](const auto& item) { return item.id == id; });
+                    const auto state = std::find_if(
+                        host->container_panel_states.begin(),
+                        host->container_panel_states.end(), [id](const auto& item) {
+                            return item.id == id;
+                        });
+                    if (panel != panels.end() && state !=
+                            host->container_panel_states.end()) {
+                        if (part < 2) {
+                            const auto& bounds = panel->scroll_buttons[
+                                static_cast<std::size_t>(part)];
+                            if (contains_point(RECT{bounds.x, bounds.y,
+                                    bounds.x + bounds.width, bounds.y + bounds.height},
+                                    host->mouse)) {
+                                const int direction = part == 0 ? -1 : 1;
+                                state->scroll_value = std::clamp(
+                                    panel->scroll_value + direction *
+                                        tibia::client::container_scroll_step,
+                                    0, panel->scroll_range);
+                            }
+                        } else if (contains_point(RECT{panel->scroll_track.x,
+                                panel->scroll_track.y,
+                                panel->scroll_track.x + panel->scroll_track.width,
+                                panel->scroll_track.y + panel->scroll_track.height},
+                                host->mouse)) {
+                            if (host->mouse.y < panel->scroll_thumb.y)
+                                state->scroll_value = std::max(0,
+                                    panel->scroll_value - 1);
+                            else if (host->mouse.y > panel->scroll_thumb.y +
+                                    panel->scroll_thumb.height)
+                                state->scroll_value = std::min(panel->scroll_range,
+                                    panel->scroll_value + 1);
                         }
                     }
                 }
@@ -12140,8 +14524,80 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 return 0;
             }
             if (message == WM_LBUTTONUP &&
+                (host->pressed_skills_scrollbar_part >= 0 ||
+                    host->skills_scrollbar_dragging)) {
+                const auto part = host->pressed_skills_scrollbar_part;
+                if (!host->skills_scrollbar_dragging) {
+                    if (const auto plan = skills_panel_window_plan(*host, window)) {
+                        const auto& geometry = plan->skills.scrollbar;
+                        const auto rect_for = [](const auto& rect) {
+                            return RECT{rect.x, rect.y,
+                                rect.x + rect.width, rect.y + rect.height};
+                        };
+                        if (part == 0 && contains_point(
+                                rect_for(geometry.up_arrow), host->mouse)) {
+                            host->skills_scroll_value =
+                                tibia::client::skills_panel_scroll_by_lines(
+                                    plan->skills.scroll_range, -1);
+                        } else if (part == 1 && contains_point(
+                                rect_for(geometry.down_arrow), host->mouse)) {
+                            host->skills_scroll_value =
+                                tibia::client::skills_panel_scroll_by_lines(
+                                    plan->skills.scroll_range, 1);
+                        } else if (part == 2 && contains_point(
+                                rect_for(geometry.track), host->mouse)) {
+                            host->skills_scroll_value =
+                                tibia::client::skills_panel_scroll_after_track_click(
+                                    plan->skills.scroll_range, geometry,
+                                    host->mouse.y);
+                        }
+                    }
+                }
+                host->pressed_skills_scrollbar_part = -1;
+                host->skills_scrollbar_dragging = false;
+                host->mouse_buttons &= ~1U;
+                if (!host->mouse_buttons) ReleaseCapture();
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+            if (message == WM_LBUTTONUP &&
                 (host->pressed_battle_scrollbar_part >= 0 ||
                     host->battle_scrollbar_dragging)) {
+                const auto part = host->pressed_battle_scrollbar_part;
+                if (!host->battle_scrollbar_dragging) {
+                    if (const auto plan = battle_panel_window_plan(*host, window)) {
+                        const auto& geometry = plan->scrollbar;
+                        const auto rect_for = [](const auto& rect) {
+                            return RECT{rect.x, rect.y,
+                                rect.x + rect.width, rect.y + rect.height};
+                        };
+                        if (part == 0 && contains_point(
+                                rect_for(geometry.up_arrow), host->mouse)) {
+                            host->battle_scroll_value = std::max(0,
+                                plan->panel.scroll_offset -
+                                    tibia::client::battle_panel_scroll_step);
+                        } else if (part == 1 && contains_point(
+                                rect_for(geometry.down_arrow), host->mouse)) {
+                            host->battle_scroll_value = std::min(
+                                plan->panel.scroll_range,
+                                plan->panel.scroll_offset +
+                                    tibia::client::battle_panel_scroll_step);
+                        } else if (part == 2 && contains_point(
+                                rect_for(geometry.track), host->mouse)) {
+                            const auto page = std::max(0,
+                                plan->panel.viewport.height -
+                                    tibia::client::battle_panel_row_height);
+                            if (host->mouse.y < geometry.thumb.y)
+                                host->battle_scroll_value = std::max(0,
+                                    plan->panel.scroll_offset - page);
+                            else if (host->mouse.y > geometry.thumb.y +
+                                    geometry.thumb.height)
+                                host->battle_scroll_value = std::min(
+                                    plan->panel.scroll_range,
+                                    plan->panel.scroll_offset + page);
+                        }
+                    }
+                }
                 host->pressed_battle_scrollbar_part = -1;
                 host->battle_scrollbar_dragging = false;
                 host->mouse_buttons &= ~1U;
@@ -12152,6 +14608,32 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             if (message == WM_LBUTTONUP &&
                 (host->pressed_vip_scrollbar_part >= 0 ||
                     host->vip_scrollbar_dragging)) {
+                const auto part = host->pressed_vip_scrollbar_part;
+                if (!host->vip_scrollbar_dragging) {
+                    if (const auto plan = vip_panel_window_plan(*host, window)) {
+                        const auto& geometry = plan->scrollbar;
+                        const auto rect_for = [](const auto& rect) {
+                            return RECT{rect.x, rect.y,
+                                rect.x + rect.width, rect.y + rect.height};
+                        };
+                        if (part == 0 && contains_point(
+                                rect_for(geometry.up_arrow), host->mouse)) {
+                            host->vip_scroll_value =
+                                tibia::client::skills_panel_scroll_by_lines(
+                                    plan->scroll, -1);
+                        } else if (part == 1 && contains_point(
+                                rect_for(geometry.down_arrow), host->mouse)) {
+                            host->vip_scroll_value =
+                                tibia::client::skills_panel_scroll_by_lines(
+                                    plan->scroll, 1);
+                        } else if (part == 2 && contains_point(
+                                rect_for(geometry.track), host->mouse)) {
+                            host->vip_scroll_value =
+                                tibia::client::skills_panel_scroll_after_track_click(
+                                    plan->scroll, geometry, host->mouse.y);
+                        }
+                    }
+                }
                 host->pressed_vip_scrollbar_part = -1;
                 host->vip_scrollbar_dragging = false;
                 host->mouse_buttons &= ~1U;
@@ -12176,15 +14658,117 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             const bool notice_open = !host->notice_text.empty();
             const bool modal_open = !host->connection_status_text.empty() ||
                 notice_open || host->motd_open ||
-                host->account_data_warning_open || host->help_open ||
+                host->account_data_warning_open || host->vip_add_dialog_open ||
+                host->vip_edit_dialog_open ||
+                host->help_open ||
                 host->hints_open || host->hint_content_open ||
                 host->rule_violation_request_form.open ||
                 host->report_violation_dialog.open ||
                 host->quest_log_open || host->quest_line_open;
             if (message == WM_LBUTTONUP)
                 host->dragged_dialog = ClientHost::DraggedDialog::none;
+            if (message == WM_LBUTTONUP && host->vip_edit_dialog_open) {
+                host->mouse = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (host->pressed_vip_edit_scroll_part >= 0) {
+                    const auto scroll = vip_edit_description_scroll_plan(*host,
+                        host->vip_edit_dialog_offset);
+                    const auto up = vip_edit_scrollbar_part_rect(scroll,
+                        scroll.scrollbar.up_arrow);
+                    const auto down = vip_edit_scrollbar_part_rect(scroll,
+                        scroll.scrollbar.down_arrow);
+                    const auto track = vip_edit_scrollbar_part_rect(scroll,
+                        scroll.scrollbar.track);
+                    const int part = host->pressed_vip_edit_scroll_part;
+                    if (!host->vip_edit_scrollbar_dragging) {
+                        if (part == 0 && contains_point(up, host->mouse))
+                            host->vip_edit_description_scroll = std::max(0,
+                                host->vip_edit_description_scroll - 1);
+                        else if (part == 1 && contains_point(down, host->mouse))
+                            host->vip_edit_description_scroll = std::min(
+                                scroll.maximum_scroll,
+                                host->vip_edit_description_scroll + 1);
+                        else if (part == 3 && contains_point(track, host->mouse) &&
+                            scroll.scrollbar.thumb_visible) {
+                            host->vip_edit_description_scroll =
+                                tibia::client::ui_scrollbar_scroll_after_track_click(
+                                    host->mouse.y - scroll.field.top,
+                                    scroll.scrollbar,
+                                    host->vip_edit_description_scroll,
+                                    static_cast<std::size_t>(scroll.maximum_scroll +
+                                        scroll.visible_lines),
+                                    scroll.visible_lines);
+                        }
+                    }
+                } else if (host->pressed_vip_edit_button == 0 &&
+                    contains_point(vip_edit_button_rect(*host, 0), host->mouse)) {
+                    submit_vip_edit_dialog(*host);
+                } else if (host->pressed_vip_edit_button == 1 && contains_point(
+                    vip_edit_button_rect(*host, 1), host->mouse)) {
+                    close_vip_edit_dialog(*host);
+                } else if (host->pressed_vip_edit_type >= 0) {
+                    const auto layout = vip_edit_layout(*host,
+                        host->vip_edit_dialog_offset);
+                    const auto type_button = vip_edit_native_rect(
+                        layout.type_buttons[static_cast<std::size_t>(
+                            host->pressed_vip_edit_type)]);
+                    if (contains_point(type_button, host->mouse))
+                        host->vip_edit_type = host->pressed_vip_edit_type;
+                } else if (host->pressed_vip_edit_notify) {
+                    const auto layout = vip_edit_layout(*host,
+                        host->vip_edit_dialog_offset);
+                    if (contains_point(vip_edit_native_rect(layout.notify_checkbox),
+                        host->mouse))
+                        host->vip_edit_notify = !host->vip_edit_notify;
+                }
+                host->pressed_vip_edit_button = -1;
+                host->pressed_vip_edit_type = -1;
+                host->pressed_vip_edit_notify = false;
+                host->pressed_vip_edit_scroll_part = -1;
+                host->vip_edit_scrollbar_dragging = false;
+                host->mouse_buttons &= ~1U;
+                if (!host->mouse_buttons) ReleaseCapture();
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+            if (message == WM_LBUTTONUP && host->vip_add_dialog_open) {
+                host->mouse = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                const int pressed = host->pressed_vip_add_button;
+                if (pressed == 0 && contains_point(vip_add_button_rect(*host, 0),
+                    host->mouse))
+                    submit_vip_add_dialog(*host);
+                else if (pressed == 1 && contains_point(
+                    vip_add_button_rect(*host, 1), host->mouse))
+                    close_vip_add_dialog(*host);
+                host->pressed_vip_add_button = -1;
+                host->mouse_buttons &= ~1U;
+                if (!host->mouse_buttons) ReleaseCapture();
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
             if (message == WM_LBUTTONUP && host->new_channel_dialog_open) {
                 host->mouse = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (!host->new_channel_scrollbar_dragging &&
+                    host->pressed_new_channel_scroll_button >= 0) {
+                    const auto list = new_channel_list_rect(*host);
+                    const int margin = ui_units(window, 3);
+                    const int row_height = ui_units(window,
+                        std::max(1, host->ui_font_heights[3]));
+                    const int visible_rows = std::max(1,
+                        (static_cast<int>(list.bottom - list.top) - 2 * margin) /
+                            row_height);
+                    const auto geometry = tibia::client::ui_scrollbar_geometry(
+                        static_cast<int>(list.right - list.left),
+                        static_cast<int>(list.bottom - list.top),
+                        host->available_channels.size(), visible_rows,
+                        host->new_channel_scroll, margin, ui_units(window, 12),
+                        ui_units(window, 12), ui_units(window, 6));
+                    host->new_channel_scroll =
+                        tibia::client::ui_scrollbar_scroll_after_release(
+                            host->mouse.x - list.left, host->mouse.y - list.top,
+                            host->pressed_new_channel_scroll_button, geometry,
+                            host->new_channel_scroll,
+                            host->available_channels.size(), visible_rows);
+                }
                 const int pressed = host->pressed_new_channel_button;
                 if (pressed == 0 && contains_point(new_channel_button_rect(*host, 0),
                     host->mouse))
@@ -12262,7 +14846,7 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 }
                 host->pressed_rule_violation_request_button = -1;
                 host->pressed_rule_violation_request_checkbox = false;
-                finish_options_list_scrollbar_interaction(*host);
+                finish_options_list_scrollbar_interaction(*host, host->mouse, true);
                 host->mouse_buttons &= ~1U;
                 if (!host->mouse_buttons) ReleaseCapture();
                 InvalidateRect(window, nullptr, FALSE);
@@ -12296,6 +14880,21 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             }
             if (message == WM_LBUTTONUP && !notice_open && host->hint_content_open) {
                 host->mouse = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (!host->hint_content_scroll_dragging &&
+                    host->pressed_hint_content_scroll_part >= 0) {
+                    const auto view = hint_content_view_rect(window,
+                        host->hint_content_dialog_offset);
+                    const int visible = hint_content_visible_lines(*host, view);
+                    const auto geometry = options_list_scrollbar_geometry(window,
+                        view, host->hint_content_lines.size(), visible,
+                        host->hint_content_scroll);
+                    host->hint_content_scroll =
+                        tibia::client::ui_scrollbar_scroll_after_release(
+                            host->mouse.x - view.left, host->mouse.y - view.top,
+                            host->pressed_hint_content_scroll_part, geometry,
+                            host->hint_content_scroll,
+                            host->hint_content_lines.size(), visible);
+                }
                 if (host->pressed_hint_content_button == 0 && contains_point(
                     hint_content_ok_rect(window, host->hint_content_dialog_offset),
                     host->mouse)) {
@@ -12310,6 +14909,22 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             if (message == WM_LBUTTONUP && !notice_open &&
                 !host->hint_content_open && host->hints_open) {
                 host->mouse = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (!host->hints_scroll_dragging &&
+                    host->pressed_hints_scroll_part >= 0) {
+                    const auto list = hints_list_rect(window,
+                        host->hints_dialog_offset);
+                    const int line_height = ui_units(window,
+                        std::max(1, host->ui_font_heights[2]));
+                    const int visible = std::max(1,
+                        static_cast<int>(list.bottom - list.top) / line_height);
+                    const auto geometry = options_list_scrollbar_geometry(window,
+                        list, host->hints.size(), visible, host->hints_scroll);
+                    host->hints_scroll =
+                        tibia::client::ui_scrollbar_scroll_after_release(
+                            host->mouse.x - list.left, host->mouse.y - list.top,
+                            host->pressed_hints_scroll_part, geometry,
+                            host->hints_scroll, host->hints.size(), visible);
+                }
                 const int pressed = host->pressed_hints_button;
                 if (pressed >= 0 && pressed < 2 && contains_point(
                     hints_button_rect(window, host->hints_dialog_offset, pressed),
@@ -12780,7 +15395,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     tibia::client::hotkey_button_height), host->mouse)) {
                     commit_hotkey_editor(*host);
                     host->pending_hotkey_object_selection = host->selected_hotkey;
-                    host->interaction_mode = tibia::client::hotkey_object_selection_mode;
+                    host->interaction_mode =
+                        tibia::client::GameInteractionMode::hotkey_object_selection;
                     host->hotkey_options_open = false;
                     host->hotkey_text_focused = false;
                     KillTimer(window, login_caret_timer_id);
@@ -12801,6 +15417,26 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             if (message == WM_LBUTTONUP && !modal_open &&
                 host->screen == UiScreen::character_selection) {
                 host->mouse = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (!host->character_scrollbar_dragging &&
+                    host->pressed_character_scroll_button >= 0) {
+                    const auto list = character_list_rect(window,
+                        host->character_selection_dialog_offset);
+                    const int margin = ui_units(window, 3);
+                    const int row_height = ui_units(window,
+                        std::max(1, host->ui_font_heights[3]));
+                    const int visible = std::max(1,
+                        (static_cast<int>(list.bottom - list.top) - 2 * margin) /
+                            row_height);
+                    const auto geometry = options_list_scrollbar_geometry(window,
+                        list, host->characters.size(), visible,
+                        host->character_list_scroll);
+                    host->character_list_scroll =
+                        tibia::client::ui_scrollbar_scroll_after_release(
+                            host->mouse.x - list.left, host->mouse.y - list.top,
+                            host->pressed_character_scroll_button, geometry,
+                            host->character_list_scroll,
+                            host->characters.size(), visible);
+                }
                 const int pressed = host->pressed_login_button;
                 if (pressed == 0 && contains_point(character_ok_rect(window,
                     host->character_selection_dialog_offset), host->mouse))
@@ -12810,6 +15446,7 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     PostMessageW(window, WM_COMMAND, MAKEWPARAM(back_button_id, BN_CLICKED), 0);
                 host->pressed_login_button = -1;
                 host->pressed_character_scroll_button = -1;
+                host->character_scrollbar_dragging = false;
                 InvalidateRect(window, nullptr, FALSE);
             }
             if (message == WM_LBUTTONUP && !modal_open &&
@@ -13069,9 +15706,10 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     const int options_action = compact ? 1 : 2;
                     if (pressed == 0 && host->send_game_command) {
                         try {
+                            host->send_game_command(
+                                tibia::client::game_stop_movement_opcode);
                             if (host->stop_action_reset_pending)
                                 host->stop_action_reset_pending->store(true);
-                            host->send_game_command(0xbe);
                         } catch (const std::exception& error) {
                             host->notice_text = error_to_wide(error.what());
                         }
@@ -13100,8 +15738,29 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             }
             if (message == WM_LBUTTONUP && !modal_open &&
                 host->screen == UiScreen::game_world &&
+                host->interaction_mode ==
+                    tibia::client::GameInteractionMode::use_with_target &&
+                host->pending_use_with_source) {
+                const auto creature_id = battle_panel_creature_at(
+                    *host, window, host->mouse);
+                if (send_use_with_creature(*host, window, creature_id) ||
+                    send_use_with_body_slot(*host, window, host->mouse) ||
+                    send_use_with_container_item(*host, window, host->mouse) ||
+                    send_use_with_map_target(*host, window, host->mouse))
+                    return 0;
+            }
+            if (message == WM_LBUTTONUP && !modal_open &&
+                host->screen == UiScreen::game_world &&
+                host->interaction_mode ==
+                    tibia::client::GameInteractionMode::trade_with_player &&
+                host->pending_trade_source &&
+                send_trade_with_map_target(*host, window, host->mouse))
+                return 0;
+            if (message == WM_LBUTTONUP && !modal_open &&
+                host->screen == UiScreen::game_world &&
                 !host->inventory_minimized &&
-                host->interaction_mode == tibia::client::hotkey_object_selection_mode &&
+                host->interaction_mode ==
+                    tibia::client::GameInteractionMode::hotkey_object_selection &&
                 host->pending_hotkey_object_selection) {
                 RECT client{};
                 GetClientRect(window, &client);
@@ -13131,7 +15790,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                                 *host->pending_hotkey_object_selection];
                             preference.data[0] = item->item.type;
                             preference.data[1] = item->item.has_extra ? item->item.extra : 0;
-                            host->interaction_mode = 0;
+                            host->interaction_mode =
+                                tibia::client::GameInteractionMode::none;
                             host->selected_hotkey = *host->pending_hotkey_object_selection;
                             host->hotkey_text_focused = false;
                             select_hotkey(*host, host->selected_hotkey);
@@ -13148,6 +15808,19 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     }
                 }
             }
+            if (message == WM_LBUTTONUP && !modal_open &&
+                host->screen == UiScreen::game_world &&
+                host->interaction_mode == tibia::client::GameInteractionMode::none &&
+                !host->console_input_focused && !host->pending_move_item_source &&
+                !host->pending_hotkey_object_selection && !host->pending_use_with_source &&
+                !host->pending_trade_source) {
+                try {
+                    if (send_map_walk_request(*host, window, host->mouse))
+                        return 0;
+                } catch (const std::exception& error) {
+                    show_notice(*host, L"Tibia", error_to_wide(error.what()));
+                }
+            }
             host->mouse_buttons &= ~(message == WM_LBUTTONUP ? 1U : message == WM_RBUTTONUP ? 2U : 4U);
             if (message == WM_LBUTTONUP) {
                 host->console_transcript_selecting = false;
@@ -13157,7 +15830,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                 host->battle_scrollbar_dragging = false;
             }
             if (!host->mouse_buttons) {
-                finish_options_list_scrollbar_interaction(*host);
+                finish_options_list_scrollbar_interaction(*host, host->mouse,
+                    message == WM_LBUTTONUP);
                 host->pressed_console_transcript_scrollbar_part = -1;
                 host->console_transcript_scrollbar_dragging = false;
                 ReleaseCapture();
@@ -13170,9 +15844,66 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
             const int accumulated_wheel = host->wheel_remainder + host->wheel_delta;
             const int wheel_steps = accumulated_wheel / WHEEL_DELTA;
             host->wheel_remainder = accumulated_wheel % WHEEL_DELTA;
-            if (host->screen == UiScreen::game_world && host->wheel_delta != 0) {
+            if (host->vip_edit_dialog_open) {
                 POINT mouse{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                 ScreenToClient(window, &mouse);
+                const auto scroll = vip_edit_description_scroll_plan(*host,
+                    host->vip_edit_dialog_offset);
+                if (contains_point(scroll.field, mouse) && wheel_steps != 0) {
+                    host->vip_edit_description_scroll = std::clamp(
+                        host->vip_edit_description_scroll - wheel_steps, 0,
+                        scroll.maximum_scroll);
+                    InvalidateRect(window, nullptr, FALSE);
+                }
+                return 0;
+            }
+            if (host->new_channel_dialog_open) {
+                POINT mouse{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                ScreenToClient(window, &mouse);
+                const auto list = new_channel_list_rect(*host);
+                if (wheel_steps != 0 && contains_point(list, mouse)) {
+                    const int margin = ui_units(window, 3);
+                    const int row_height = ui_units(window,
+                        std::max(1, host->ui_font_heights[3]));
+                    const int visible = std::max(1,
+                        (static_cast<int>(list.bottom - list.top) - 2 * margin) /
+                            row_height);
+                    const int maximum = std::max(0,
+                        static_cast<int>(host->available_channels.size()) - visible);
+                    host->new_channel_scroll = std::clamp(
+                        host->new_channel_scroll - wheel_steps, 0, maximum);
+                    InvalidateRect(window, nullptr, FALSE);
+                }
+                return 0;
+            }
+            const bool wheel_modal_open = host->options_open ||
+                host->console_options_open || host->general_options_open ||
+                host->hotkey_options_open || host->network_options_open ||
+                host->graphics_options_open || host->advanced_graphics_options_open ||
+                host->battle_context_menu.has_value() ||
+                host->skills_context_menu.has_value() ||
+                host->vip_context_menu.has_value() ||
+                host->console_context_menu.has_value() ||
+                host->container_item_context_menu.has_value() ||
+                !host->connection_status_text.empty() ||
+                !host->notice_text.empty() || host->motd_open ||
+                host->account_data_warning_open || host->vip_add_dialog_open ||
+                host->help_open || host->hints_open || host->hint_content_open ||
+                host->rule_violation_request_form.open ||
+                host->report_violation_dialog.open || host->quest_log_open ||
+                host->quest_line_open;
+            if (host->screen == UiScreen::game_world && host->wheel_delta != 0 &&
+                !wheel_modal_open) {
+                POINT mouse{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                ScreenToClient(window, &mouse);
+                const auto scrollbar_contains = [mouse](const auto& geometry) {
+                    const auto contains = [mouse](const auto& part) {
+                        return contains_point(RECT{part.x, part.y,
+                            part.x + part.width, part.y + part.height}, mouse);
+                    };
+                    return contains(geometry.up_arrow) || contains(geometry.track) ||
+                        contains(geometry.down_arrow);
+                };
                 const auto& transcript = host->console_transcript_clip;
                 const auto& scrollbar = host->console_transcript_scrollbar_viewport;
                 if (host->console_transcript_scrollbar_geometry_valid &&
@@ -13189,12 +15920,54 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     }
                     return 0;
                 }
+                if (const auto snapshot = host->game_world_mailbox->read()) {
+                    RECT client{};
+                    GetClientRect(window, &client);
+                    const auto game_layout = tibia::client::resolve_game_window_layout({
+                        client.right - client.left, client.bottom - client.top,
+                        host->console_height, tibia::client::map_panel_height,
+                        tibia::client::map_window_minimum_height,
+                        host->no_stretching});
+                    if (game_layout) {
+                        const auto panels = container_panel_layouts(*host, window,
+                            *snapshot, *game_layout);
+                        for (auto panel = panels.rbegin(); panel != panels.rend(); ++panel) {
+                            const auto& viewport = panel->item_viewport;
+                            const RECT viewport_rect{viewport.x, viewport.y,
+                                viewport.x + viewport.width,
+                                viewport.y + viewport.height};
+                            const auto& top_button = panel->scroll_buttons[0];
+                            const auto& bottom_button = panel->scroll_buttons[1];
+                            const RECT scrollbar_rect{top_button.x, top_button.y,
+                                top_button.x + top_button.width,
+                                bottom_button.y + bottom_button.height};
+                            if (!panel->scrollable ||
+                                (!contains_point(viewport_rect, mouse) &&
+                                    !contains_point(scrollbar_rect, mouse))) continue;
+                            const auto state = std::find_if(
+                                host->container_panel_states.begin(),
+                                host->container_panel_states.end(),
+                                [panel](const auto& item) {
+                                    return item.id == panel->id;
+                                });
+                            if (state != host->container_panel_states.end()) {
+                                state->scroll_value = std::clamp(
+                                    panel->scroll_value - wheel_steps *
+                                        tibia::client::container_scroll_step,
+                                    0, panel->scroll_range);
+                                InvalidateRect(window, nullptr, FALSE);
+                            }
+                            return 0;
+                        }
+                    }
+                }
                 if (const auto plan = battle_panel_window_plan(*host, window)) {
                     const auto& viewport = plan->panel.viewport;
                     const RECT viewport_rect{viewport.x, viewport.y,
                         viewport.x + viewport.width,
                         viewport.y + viewport.height};
-                    if (contains_point(viewport_rect, mouse)) {
+                    if (contains_point(viewport_rect, mouse) ||
+                        scrollbar_contains(plan->scrollbar)) {
                         host->battle_scroll_value = std::clamp(
                             plan->panel.scroll_offset - wheel_steps *
                                 tibia::client::battle_panel_scroll_step,
@@ -13208,7 +15981,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     const RECT viewport_rect{viewport.x, viewport.y,
                         viewport.x + viewport.width,
                         viewport.y + viewport.height};
-                    if (contains_point(viewport_rect, mouse)) {
+                    if (contains_point(viewport_rect, mouse) ||
+                        scrollbar_contains(plan->scrollbar)) {
                         host->vip_scroll_value =
                             tibia::client::skills_panel_scroll_by_lines(
                                 plan->scroll, -wheel_steps);
@@ -13220,7 +15994,8 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     const auto& panel = plan->skills.panel;
                     const RECT panel_rect{panel.x, panel.y,
                         panel.x + panel.width, panel.y + panel.height};
-                    if (contains_point(panel_rect, mouse)) {
+                    if (contains_point(panel_rect, mouse) ||
+                        scrollbar_contains(plan->skills.scrollbar)) {
                         host->skills_scroll_value =
                             tibia::client::skills_panel_scroll_by_lines(
                                 plan->skills.scroll_range, -wheel_steps);
@@ -13258,19 +16033,30 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                     InvalidateRect(window, nullptr, FALSE);
                 }
             } else if (host->hotkey_options_open && wheel_steps != 0) {
-                const auto maximum = tibia::client::hotkey_count -
-                    tibia::client::hotkey_list_visible_rows;
-                const int scroll = static_cast<int>(host->hotkey_list_scroll) - wheel_steps;
-                host->hotkey_list_scroll = static_cast<std::size_t>(std::clamp(
-                    scroll, 0, static_cast<int>(maximum)));
-                InvalidateRect(window, nullptr, FALSE);
+                POINT mouse{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                ScreenToClient(window, &mouse);
+                if (contains_point(hotkey_options_list_rect(window,
+                    host->hotkey_options_dialog_offset), mouse)) {
+                    const auto maximum = tibia::client::hotkey_count -
+                        tibia::client::hotkey_list_visible_rows;
+                    const int scroll = static_cast<int>(host->hotkey_list_scroll) -
+                        wheel_steps;
+                    host->hotkey_list_scroll = static_cast<std::size_t>(std::clamp(
+                        scroll, 0, static_cast<int>(maximum)));
+                    InvalidateRect(window, nullptr, FALSE);
+                }
             } else if (host->graphics_options_open && wheel_steps != 0) {
-                const int maximum = std::max(0, static_cast<int>(
-                    host->graphics_display_modes.size()) -
-                    tibia::client::graphics_options_visible_rows);
-                host->graphics_mode_scroll = std::clamp(host->graphics_mode_scroll -
-                    wheel_steps, 0, maximum);
-                InvalidateRect(window, nullptr, FALSE);
+                POINT mouse{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                ScreenToClient(window, &mouse);
+                if (contains_point(graphics_options_list_rect(window,
+                    host->graphics_options_dialog_offset), mouse)) {
+                    const int maximum = std::max(0, static_cast<int>(
+                        host->graphics_display_modes.size()) -
+                        tibia::client::graphics_options_visible_rows);
+                    host->graphics_mode_scroll = std::clamp(
+                        host->graphics_mode_scroll - wheel_steps, 0, maximum);
+                    InvalidateRect(window, nullptr, FALSE);
+                }
             } else if (host->quest_line_open && wheel_steps != 0) {
                 POINT mouse{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                 ScreenToClient(window, &mouse);
@@ -13303,7 +16089,27 @@ LRESULT CALLBACK window_proc_impl(HWND window, UINT message, WPARAM wparam, LPAR
                         wheel_steps, 0, maximum);
                     InvalidateRect(window, nullptr, FALSE);
                 }
+            } else if (host->screen == UiScreen::character_selection &&
+                wheel_steps != 0) {
+                POINT mouse{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                ScreenToClient(window, &mouse);
+                const auto list = character_list_rect(window,
+                    host->character_selection_dialog_offset);
+                if (contains_point(list, mouse)) {
+                    const int margin = ui_units(window, 3);
+                    const int row_height = ui_units(window,
+                        std::max(1, host->ui_font_heights[3]));
+                    const int visible = std::max(1,
+                        (static_cast<int>(list.bottom - list.top) - 2 * margin) /
+                            row_height);
+                    const int maximum = std::max(0,
+                        static_cast<int>(host->characters.size()) - visible);
+                    host->character_list_scroll = std::clamp(
+                        host->character_list_scroll - wheel_steps, 0, maximum);
+                    InvalidateRect(window, nullptr, FALSE);
+                }
             }
+            if (wheel_modal_open) return 0;
         }
         break;
     case WM_DESTROY:

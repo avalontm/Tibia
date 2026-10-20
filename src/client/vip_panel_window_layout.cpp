@@ -15,7 +15,8 @@ std::optional<VipPanelWindowPlan> make_vip_panel_window_plan(
     int origin_y,
     std::span<const RestoredContentWindow> restored_windows,
     std::span<const network::State6BuddyEntry> contacts,
-    int scroll_value) {
+    int scroll_value,
+    std::optional<std::span<const std::size_t>> contact_order) {
     const auto vip = std::find_if(restored_windows.begin(), restored_windows.end(),
         [](const auto& window) { return window.type == ContentWindowType::vip; });
     if (vip == restored_windows.end()) return std::nullopt;
@@ -32,7 +33,9 @@ std::optional<VipPanelWindowPlan> make_vip_panel_window_plan(
         occupied_height += height;
     }
 
-    const auto row_count = std::min<std::size_t>(contacts.size(),
+    const auto visible_contact_count = contact_order
+        ? contact_order->size() : contacts.size();
+    const auto row_count = std::min<std::size_t>(visible_contact_count,
         static_cast<std::size_t>((std::numeric_limits<int>::max() -
             vip_panel_body_padding) / vip_panel_row_height));
     const int natural_body_height = vip_panel_body_padding +
@@ -58,9 +61,10 @@ std::optional<VipPanelWindowPlan> make_vip_panel_window_plan(
         plan.frame.body.height};
     plan.scroll = make_skills_panel_scroll_range(natural_body_height,
         plan.viewport.height, scroll_value, vip_panel_row_height);
-    plan.rows.reserve(contacts.size());
-    for (std::size_t index = 0; index < contacts.size(); ++index) {
-        const int top = plan.viewport.y + static_cast<int>(index) *
+    plan.rows.reserve(row_count);
+    for (std::size_t visible_index = 0; visible_index < row_count; ++visible_index) {
+        const auto index = contact_order ? (*contact_order)[visible_index] : visible_index;
+        const int top = plan.viewport.y + static_cast<int>(visible_index) *
             vip_panel_row_height - plan.scroll.value;
         const int clipped_top = std::max(top, plan.viewport.y);
         const int clipped_bottom = std::min(top + vip_panel_row_height,

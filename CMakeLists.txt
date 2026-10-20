@@ -17,7 +17,10 @@ add_library(tibia_core STATIC
     src/client/battle_panel_layout.cpp
     src/client/battle_panel_window_layout.cpp
     src/client/vip_panel_window_layout.cpp
+    src/client/vip_contact_order.cpp
     src/client/vip_context_menu.cpp
+    src/client/vip_add_dialog_layout.cpp
+    src/client/vip_edit_dialog_layout.cpp
     src/client/battle_panel_renderer.cpp
     src/client/battle_panel_interaction.cpp
     src/client/console_context_menu.cpp
@@ -32,6 +35,10 @@ add_library(tibia_core STATIC
     src/client/inventory_panel_renderer.cpp
     src/client/container_panel_layout.cpp
     src/client/container_panel_renderer.cpp
+    src/client/container_item_interaction.cpp
+    src/client/container_item_context_menu.cpp
+    src/client/move_item_dialog_state.cpp
+    src/client/move_item_dialog_layout.cpp
     src/client/inventory_item_visual.cpp
     src/client/skills_panel_model.cpp
     src/client/skills_panel_layout.cpp
@@ -59,8 +66,10 @@ add_library(tibia_core STATIC
     src/client/map_window_layout.cpp
     src/client/map_window_frame_layout.cpp
     src/client/game_screen_control_layout.cpp
+    src/client/game_movement_request.cpp
     src/client/automap_panel_layout.cpp
     src/client/map_window_camera.cpp
+    src/client/map_player_target.cpp
     src/client/map_window_item_frame.cpp
     src/client/map_window_light_sources.cpp
     src/client/map_window_creature_renderer.cpp
@@ -87,6 +96,8 @@ add_library(tibia_core STATIC
     src/network/login_session.cpp
     src/network/speech_request.cpp
     src/network/channel_request.cpp
+    src/network/container_request.cpp
+    src/network/item_action_request.cpp
     src/network/console_filter_request.cpp
     src/network/message_dispatcher.cpp
     src/navigation/navigation.cpp
@@ -96,6 +107,10 @@ add_library(tibia_core STATIC
     src/map/floor_window.cpp
     src/map/item_render_traversal.cpp
     src/map/tile_object_order.cpp
+    src/map/use_target_at.cpp
+    src/map/move_item_source_at.cpp
+    src/map/map_position_at.cpp
+    src/map/use_target_selection.cpp
     src/map/light_field.cpp
     src/map/render_queue.cpp
     src/map/render_cell_filter.cpp

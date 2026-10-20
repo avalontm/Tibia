@@ -52,4 +52,12 @@ std::vector<std::uint8_t> encode_state6_close_rule_violation_request() {
     return std::move(writer).take();
 }
 
+std::vector<std::uint8_t> encode_state6_remove_vip_request(
+    std::uint32_t character_id) {
+    PacketWriter writer;
+    writer.write_u8(0xDD);
+    writer.write_u32(character_id);
+    return std::move(writer).take();
+}
+
 }

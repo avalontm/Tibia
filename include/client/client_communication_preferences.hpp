@@ -14,6 +14,13 @@
 
 namespace tibia::client {
 
+struct BuddyPreference {
+    std::uint32_t id{};
+    std::int32_t type{};
+    std::string name;
+    bool enabled{};
+};
+
 struct ClientCommunicationPreferences {
     std::int32_t console_height{};
     std::int32_t basic_brightness{32};
@@ -21,7 +28,9 @@ struct ClientCommunicationPreferences {
     std::int32_t engine{-1};
     std::int32_t automap_zoom{2};
     std::array<std::int32_t, 3> fullscreen_mode{};
+    std::array<std::int32_t, 3> buddy_sort_methods{};
     bool fullscreen_mode_configured{};
+    bool buddy_hide_offline{};
     bool light_effects{true};
     bool no_stretching{};
     bool windows_mouse_pointer{true};
@@ -41,6 +50,7 @@ struct ClientCommunicationPreferences {
     std::vector<std::int32_t> open_dialogs;
     std::vector<ContentWindowPreference> content_windows;
     std::vector<std::int32_t> known_hints;
+    std::vector<BuddyPreference> buddies;
     std::vector<std::string> white_list;
     std::vector<std::string> ignore_list;
 };

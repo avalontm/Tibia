@@ -134,6 +134,87 @@ std::vector<std::int32_t> parse_integer_list(const std::string& value,
     return values;
 }
 
+BuddyPreference parse_buddy_preference(const std::string& value,
+    std::size_t line_number) {
+    std::size_t position = 0;
+    const auto skip_space = [&] {
+        while (position < value.size() &&
+            std::isspace(static_cast<unsigned char>(value[position])) != 0) ++position;
+    };
+    const auto parse_integer_field = [&]<typename Integer>(Integer& result) {
+        skip_space();
+        const auto parsed = std::from_chars(value.data() + position,
+            value.data() + value.size(), result);
+        if (parsed.ec != std::errc{} || parsed.ptr == value.data() + position)
+            throw std::runtime_error("invalid Tibia.cfg buddy at line " +
+                std::to_string(line_number));
+        position = static_cast<std::size_t>(parsed.ptr - value.data());
+    };
+    skip_space();
+    if (position == value.size() || value[position++] != '(')
+        throw std::runtime_error("invalid Tibia.cfg buddy at line " +
+            std::to_string(line_number));
+    BuddyPreference buddy;
+    parse_integer_field(buddy.id);
+    skip_space();
+    if (position == value.size() || value[position++] != ',')
+        throw std::runtime_error("invalid Tibia.cfg buddy at line " +
+            std::to_string(line_number));
+    parse_integer_field(buddy.type);
+    skip_space();
+    if (position == value.size() || value[position++] != ',')
+        throw std::runtime_error("invalid Tibia.cfg buddy at line " +
+            std::to_string(line_number));
+    skip_space();
+    if (position == value.size() || value[position++] != '\"')
+        throw std::runtime_error("invalid Tibia.cfg buddy name at line " +
+            std::to_string(line_number));
+    bool closed = false;
+    while (position < value.size()) {
+        const char character = value[position++];
+        if (character == '\"') {
+            closed = true;
+            break;
+        }
+        if (character == '\\') {
+            if (position == value.size()) break;
+            const char escaped = value[position++];
+            if (escaped == 'n') buddy.name.push_back('\n');
+            else if (escaped == '\"' || escaped == '\\') buddy.name.push_back(escaped);
+            else throw std::runtime_error("invalid Tibia.cfg buddy escape at line " +
+                std::to_string(line_number));
+        } else {
+            buddy.name.push_back(character);
+        }
+    }
+    if (!closed)
+        throw std::runtime_error("unterminated Tibia.cfg buddy name at line " +
+            std::to_string(line_number));
+    skip_space();
+    if (position == value.size() || value[position++] != ',')
+        throw std::runtime_error("invalid Tibia.cfg buddy at line " +
+            std::to_string(line_number));
+    skip_space();
+    if (value.compare(position, 3, "yes") == 0) {
+        buddy.enabled = true;
+        position += 3;
+    } else if (value.compare(position, 2, "no") == 0) {
+        position += 2;
+    } else {
+        throw std::runtime_error("invalid Tibia.cfg buddy status at line " +
+            std::to_string(line_number));
+    }
+    skip_space();
+    if (position == value.size() || value[position++] != ')')
+        throw std::runtime_error("invalid Tibia.cfg buddy at line " +
+            std::to_string(line_number));
+    skip_space();
+    if (position != value.size())
+        throw std::runtime_error("trailing data after Tibia.cfg buddy at line " +
+            std::to_string(line_number));
+    return buddy;
+}
+
 bool has_list_closing_brace(std::string_view value) {
     bool quoted = false;
     bool escaped = false;
@@ -175,6 +256,18 @@ std::string serialize_integer_list(const std::vector<std::int32_t>& values) {
         value += std::to_string(values[index]);
     }
     value.push_back('}');
+    return value;
+}
+
+std::string serialize_buddy_preference(const BuddyPreference& buddy) {
+    std::string value = "Buddy = (" + std::to_string(buddy.id) + "," +
+        std::to_string(buddy.type) + ",\"";
+    for (const char character : buddy.name) {
+        if (character == '\"' || character == '\\') value.push_back('\\');
+        if (character == '\n') value += "\\n";
+        else value.push_back(character);
+    }
+    value += buddy.enabled ? "\",yes)" : "\",no)";
     return value;
 }
 
@@ -323,6 +416,12 @@ ClientCommunicationPreferences read_communication_preferences(
             const auto fields = parse_integer_pair(value, line_number);
             preferences.content_windows.push_back({fields[0], fields[1]});
         }
+        else if (key == "buddysortmethods") {
+            preferences.buddy_sort_methods = parse_display_mode(value, line_number);
+        } else if (key == "buddyhideoffline")
+            preferences.buddy_hide_offline = parse_yes_no(value, line_number);
+        else if (key == "buddy")
+            preferences.buddies.push_back(parse_buddy_preference(value, line_number));
         else if (key == "levelbar")
             preferences.skills_bar_visibility.level = parse_yes_no(value, line_number);
         else if (key == "staminabar")
@@ -480,6 +579,12 @@ void write_communication_preferences(const std::filesystem::path& path,
     const auto engine_value = std::string("Engine = ") + std::to_string(preferences.engine);
     const auto automap_zoom_value = std::string("AutomapZoom = ") +
         std::to_string(preferences.automap_zoom);
+    const auto buddy_sort_methods_value = std::string("BuddySortmethods = (") +
+        std::to_string(preferences.buddy_sort_methods[0]) + "," +
+        std::to_string(preferences.buddy_sort_methods[1]) + "," +
+        std::to_string(preferences.buddy_sort_methods[2]) + ")";
+    const auto buddy_hide_offline_value = std::string("BuddyHideOffline = ") +
+        (preferences.buddy_hide_offline ? "yes" : "no");
     const auto light_effects_value = std::string("LightEffects = ") +
         (preferences.light_effects ? "yes" : "no");
     const auto no_stretching_value = std::string("NoStretching = ") +
@@ -514,12 +619,15 @@ void write_communication_preferences(const std::filesystem::path& path,
     bool confine_framerate_written = false;
     bool engine_written = false;
     bool automap_zoom_written = false;
+    bool buddy_sort_methods_written = false;
+    bool buddy_hide_offline_written = false;
     bool light_effects_written = false;
     bool no_stretching_written = false;
     bool mouse_pointer_written = false;
     bool white_written = false;
     bool ignore_written = false;
     bool known_hints_written = false;
+    bool buddies_written = false;
     bool hotkeys_written = false;
     bool open_dialogs_written = false;
     bool content_windows_written = false;
@@ -532,6 +640,10 @@ void write_communication_preferences(const std::filesystem::path& path,
     const auto serialize_content_windows = [&] {
         for (const auto& window : preferences.content_windows)
             output.push_back(serialize_content_window(window));
+    };
+    const auto serialize_buddies = [&] {
+        for (const auto& buddy : preferences.buddies)
+            if (buddy.id != 0) output.push_back(serialize_buddy_preference(buddy));
     };
 
     for (std::size_t index = 0; index < lines.size(); ++index) {
@@ -622,6 +734,12 @@ void write_communication_preferences(const std::filesystem::path& path,
         } else if (key == "automapzoom") {
             output.push_back(automap_zoom_value);
             automap_zoom_written = true;
+        } else if (key == "buddysortmethods") {
+            output.push_back(buddy_sort_methods_value);
+            buddy_sort_methods_written = true;
+        } else if (key == "buddyhideoffline") {
+            output.push_back(buddy_hide_offline_value);
+            buddy_hide_offline_written = true;
         } else if (key == "lighteffects") {
             output.push_back(light_effects_value);
             light_effects_written = true;
@@ -658,6 +776,9 @@ void write_communication_preferences(const std::filesystem::path& path,
                 existing_value += "\n" + lines[++index];
             if (!known_hints_written) output.push_back(known_hints_value);
             known_hints_written = true;
+        } else if (key == "buddy") {
+            if (!buddies_written) serialize_buddies();
+            buddies_written = true;
         } else {
             output.push_back(lines[index]);
         }
@@ -688,12 +809,15 @@ void write_communication_preferences(const std::filesystem::path& path,
     if (!confine_framerate_written) output.push_back(confine_framerate_value);
     if (!engine_written) output.push_back(engine_value);
     if (!automap_zoom_written) output.push_back(automap_zoom_value);
+    if (!buddy_sort_methods_written) output.push_back(buddy_sort_methods_value);
+    if (!buddy_hide_offline_written) output.push_back(buddy_hide_offline_value);
     if (!light_effects_written) output.push_back(light_effects_value);
     if (!no_stretching_written) output.push_back(no_stretching_value);
     if (!mouse_pointer_written) output.push_back(mouse_pointer_value);
     if (!white_written) output.push_back(white_value);
     if (!ignore_written) output.push_back(ignore_value);
     if (!known_hints_written) output.push_back(known_hints_value);
+    if (!buddies_written) serialize_buddies();
     if (!open_dialogs_written) serialize_open_dialogs();
     if (!content_windows_written) serialize_content_windows();
     if (!hotkeys_written) {

@@ -81,8 +81,10 @@ void ContainerPanelRenderer::draw(render::GraphicsRenderer& renderer,
                     continue;
                 }
             }
-            renderer.draw(texture_id, cell.bounds.x, cell.bounds.y,
-                cell.bounds.width, cell.bounds.height);
+            renderer.draw_clipped(texture_id, cell.bounds.x, cell.bounds.y,
+                cell.bounds.width, cell.bounds.height, panel.item_viewport.x,
+                panel.item_viewport.y, panel.item_viewport.width,
+                panel.item_viewport.height);
         }
     }
 }

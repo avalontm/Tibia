@@ -26,6 +26,9 @@ struct UiScrollbarGeometry {
 [[nodiscard]] int ui_scrollbar_scroll_after_track_click(int pointer_y,
     const UiScrollbarGeometry& geometry, int first_visible,
     std::size_t item_count, int visible_items);
+[[nodiscard]] int ui_scrollbar_scroll_after_release(int pointer_x,
+    int pointer_y, int pressed_part, const UiScrollbarGeometry& geometry,
+    int first_visible, std::size_t item_count, int visible_items);
 [[nodiscard]] int ui_scrollbar_scroll_after_thumb_drag(int pointer_y,
     int grab_offset, const UiScrollbarGeometry& geometry,
     std::size_t item_count, int visible_items);

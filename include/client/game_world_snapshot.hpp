@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace tibia::client {
@@ -109,9 +110,12 @@ public:
         const network::State6Opcode82State& world_light,
         const network::State6NativeStatusState& native_status);
     [[nodiscard]] std::shared_ptr<const GameWorldSnapshot> read() const;
+    [[nodiscard]] std::optional<std::vector<network::State6PathSearchCell>>
+    path_search_grid(network::State6PlayerPosition origin);
     void set_automap_zoom(std::int32_t zoom) noexcept;
     [[nodiscard]] std::int32_t automap_zoom() const noexcept;
     void apply_automap_action(map::AutomapAction action);
+    void remove_vip_contact(std::uint32_t character_id);
     void clear() noexcept;
 
 private:
@@ -119,6 +123,7 @@ private:
     std::shared_ptr<const GameWorldSnapshot> snapshot_;
     map::AutomapStore automap_store_;
     map::AutomapViewState automap_view_state_;
+    std::unordered_set<std::uint32_t> removed_vip_contact_ids_;
     const resources::TibiaDatFile* automap_dat_{};
     std::uint64_t next_sequence_{};
 };

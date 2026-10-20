@@ -1,6 +1,7 @@
 #include "client/ui_scrollbar_layout.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace tibia::client {
 
@@ -34,8 +35,10 @@ UiScrollbarGeometry ui_scrollbar_geometry(int viewport_width, int viewport_heigh
         return geometry;
 
     const int minimum_thumb = std::min(2 * thumb_cap_height, track_height);
-    const int proportional_thumb = track_height * visible_items /
-        static_cast<int>(item_count);
+    const float visible_ratio = static_cast<float>(visible_items) /
+        static_cast<float>(item_count);
+    const int proportional_thumb = static_cast<int>(std::nearbyint(
+        static_cast<double>(visible_ratio) * track_height));
     const int thumb_height = std::clamp(proportional_thumb, minimum_thumb, track_height);
     const int travel = track_height - thumb_height;
     const int position = std::clamp(first_visible, 0, maximum) * travel / maximum;
@@ -51,6 +54,25 @@ int ui_scrollbar_scroll_after_track_click(int pointer_y,
     const int page = std::max(0, visible_items - 1);
     if (pointer_y < geometry.thumb.top) first_visible -= page;
     else if (pointer_y >= geometry.thumb.bottom) first_visible += page;
+    return std::clamp(first_visible, 0, max_scroll(item_count, visible_items));
+}
+
+int ui_scrollbar_scroll_after_release(int pointer_x, int pointer_y,
+    int pressed_part, const UiScrollbarGeometry& geometry, int first_visible,
+    std::size_t item_count, int visible_items) {
+    const auto contains = [pointer_x, pointer_y](const UiScrollbarRect& rect) {
+        return pointer_x >= rect.left && pointer_y >= rect.top &&
+            pointer_x < rect.right && pointer_y < rect.bottom;
+    };
+    if (pressed_part == 0 && contains(geometry.up_arrow)) {
+        --first_visible;
+    } else if (pressed_part == 1 && contains(geometry.down_arrow)) {
+        ++first_visible;
+    } else if (pressed_part == 2 && geometry.thumb_visible &&
+        contains(geometry.track)) {
+        first_visible = ui_scrollbar_scroll_after_track_click(pointer_y,
+            geometry, first_visible, item_count, visible_items);
+    }
     return std::clamp(first_visible, 0, max_scroll(item_count, visible_items));
 }
 

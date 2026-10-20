@@ -42,6 +42,7 @@ inline constexpr int vip_panel_scrollbar_width = 12;
     int origin_y,
     std::span<const RestoredContentWindow> restored_windows,
     std::span<const network::State6BuddyEntry> contacts,
-    int scroll_value);
+    int scroll_value,
+    std::optional<std::span<const std::size_t>> contact_order = std::nullopt);
 
 }

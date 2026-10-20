@@ -12,6 +12,8 @@ namespace tibia::resources { struct TibiaDatFile; }
 
 namespace tibia::network {
 
+inline constexpr std::uint8_t state6_stop_action_opcode = 0x69;
+
 struct State6TileNativePropertySummary {
     bool all_objects_resolved{};
     bool property_00_present{};
@@ -40,6 +42,8 @@ struct State6PathTargetRequest {
     State6PlayerPosition target{};
     std::uint8_t option_0x05A09{}, option_0x05A08{};
 };
+[[nodiscard]] bool state6_path_target_is_near(State6PlayerPosition current,
+    State6PlayerPosition target) noexcept;
 enum class State6PathTargetUpdate : std::uint8_t { unchanged, changed };
 [[nodiscard]] State6PathTargetUpdate update_observed_state6_path_target(
     tibia::navigation::LocalPlayerMovementState& globals, State6PlayerPosition current_position,
@@ -52,7 +56,7 @@ struct State6B5StallState {
 struct State6B5StallEffect {
     bool stop_action_required{};
     std::uint32_t unchanged_position_calls{};
-    std::uint8_t stop_action_opcode{0xBE};
+    std::uint8_t stop_action_opcode{state6_stop_action_opcode};
 };
 [[nodiscard]] State6B5StallEffect observe_state6_b5_position(
     State6B5StallState& state, State6PlayerPosition position) noexcept;

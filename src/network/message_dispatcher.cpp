@@ -736,8 +736,12 @@ void apply_state6_container_open(std::vector<State6Container>& containers,
     if (observed.items.size() > 36) observed.items.resize(36);
     const auto it = std::find_if(containers.begin(), containers.end(),
         [&](const State6Container& current) { return current.id == container.id; });
-    if (it != containers.end())
-        throw std::runtime_error("state-6 container-open received an already-open container ID");
+    if (it != containers.end()) {
+        observed.revision = it->revision + 1;
+        *it = std::move(observed);
+        return;
+    }
+    observed.revision = 1;
     containers.push_back(std::move(observed));
 }
 
@@ -812,36 +816,28 @@ bool apply_observed_state6_thing_move(State6DecodedMap& map,
     const auto delta_x = static_cast<std::int32_t>(move.new_x) - move.old_x;
     const auto delta_y = static_cast<std::int32_t>(move.new_y) - move.old_y;
     const auto delta_floor = static_cast<std::int32_t>(move.new_floor) - move.old_floor;
-    const bool short_same_floor_move = delta_floor == 0 &&
-        std::abs(delta_x) < 2 && std::abs(delta_y) < 2;
-    if (moves_local_player && short_same_floor_move) {
-        (void)apply_observed_state6_local_player_reset(movement, creatures,
-            map.local_player_id);
-    } else if (moved_creature_id != 0 && movement.at_0x00605A24 != 0) {
+    if (moved_creature_id != 0 && movement.at_0x00605A24 != 0) {
         const auto* state = creatures.find(moved_creature_id);
         if (state == nullptr) {
             apply_state6_thing_move(map, dat, move);
             return moves_local_player;
         }
-        auto duration_parameter = 0;
         const auto destination = std::find_if(map.tiles.begin(), map.tiles.end(),
             [&move](const auto& tile) {
                 return tile.x == move.new_x && tile.y == move.new_y &&
                     tile.floor == move.new_floor;
             });
-        if (!short_same_floor_move) {
-            if (destination == map.tiles.end() || destination->objects.empty()) {
-                apply_state6_thing_move(map, dat, move);
-                return moves_local_player;
-            }
-            const auto* ground = dat.find_item(destination->objects.front().type);
-            const auto* speed = ground == nullptr ? nullptr : ground->find_attribute(0x00);
-            if (speed == nullptr || speed->payload_words.empty()) {
-                apply_state6_thing_move(map, dat, move);
-                return moves_local_player;
-            }
-            duration_parameter = speed->payload_words.front();
+        if (destination == map.tiles.end() || destination->objects.empty()) {
+            apply_state6_thing_move(map, dat, move);
+            return moves_local_player;
         }
+        const auto* ground = dat.find_item(destination->objects.front().type);
+        const auto* speed = ground == nullptr ? nullptr : ground->find_attribute(0x00);
+        if (speed == nullptr || speed->payload_words.empty()) {
+            apply_state6_thing_move(map, dat, move);
+            return moves_local_player;
+        }
+        const auto duration_parameter = speed->payload_words.front();
         const auto speed_offset = static_cast<std::size_t>(0x8c -
             State6CreatureRuntimeState::first_native_offset);
         const auto creature_speed = static_cast<std::uint32_t>(
@@ -853,8 +849,7 @@ bool apply_observed_state6_thing_move(State6DecodedMap& map,
             State6CreatureRuntimeState::first_native_offset);
         const auto effect = make_observed_state6_creature_move_state(movement,
             State6CreatureMoveStateInput{
-                short_same_floor_move ? 0 : delta_x,
-                short_same_floor_move ? 0 : delta_y,
+                delta_x, delta_y,
                 duration_parameter, static_cast<std::int32_t>(creature_speed),
                 static_cast<std::int32_t>(movement.at_0x00605A24), moved_creature_id,
                 map.local_player_id, first_timer_sample, second_timer_sample,

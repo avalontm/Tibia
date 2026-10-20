@@ -1,6 +1,7 @@
 #include "client/game_world_snapshot.hpp"
 #include "map/tile_object_order.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <unordered_set>
 #include <utility>
@@ -171,6 +172,13 @@ void GameWorldSnapshotMailbox::publish(
     snapshot->status_text = talk_system.status_text();
     snapshot->status_visible = talk_system.has_active_status_message();
     const std::lock_guard lock(mutex_);
+    std::erase_if(removed_vip_contact_ids_, [&](std::uint32_t id) {
+        return std::none_of(buddies.entries().begin(), buddies.entries().end(),
+            [id](const network::State6BuddyEntry& entry) { return entry.id == id; });
+    });
+    std::erase_if(snapshot->vip_contacts, [&](const network::State6BuddyEntry& entry) {
+        return removed_vip_contact_ids_.contains(entry.id);
+    });
     if (map) {
         const auto player = std::find_if(snapshot->creatures.begin(),
             snapshot->creatures.end(), [&](const GameWorldCreatureSnapshot& creature) {
@@ -192,6 +200,13 @@ void GameWorldSnapshotMailbox::publish(
 std::shared_ptr<const GameWorldSnapshot> GameWorldSnapshotMailbox::read() const {
     const std::lock_guard lock(mutex_);
     return snapshot_;
+}
+
+std::optional<std::vector<network::State6PathSearchCell>>
+GameWorldSnapshotMailbox::path_search_grid(
+    network::State6PlayerPosition origin) {
+    const std::lock_guard lock(mutex_);
+    return automap_store_.path_search_grid(origin);
 }
 
 void GameWorldSnapshotMailbox::set_automap_zoom(std::int32_t zoom) noexcept {
@@ -223,9 +238,21 @@ void GameWorldSnapshotMailbox::apply_automap_action(map::AutomapAction action) {
     snapshot_ = std::move(updated);
 }
 
+void GameWorldSnapshotMailbox::remove_vip_contact(std::uint32_t character_id) {
+    const std::lock_guard lock(mutex_);
+    removed_vip_contact_ids_.insert(character_id);
+    if (!snapshot_) return;
+    auto updated = std::make_shared<GameWorldSnapshot>(*snapshot_);
+    std::erase_if(updated->vip_contacts, [character_id](
+        const network::State6BuddyEntry& entry) { return entry.id == character_id; });
+    updated->sequence = next_sequence_++;
+    snapshot_ = std::move(updated);
+}
+
 void GameWorldSnapshotMailbox::clear() noexcept {
     const std::lock_guard lock(mutex_);
     snapshot_.reset();
+    removed_vip_contact_ids_.clear();
     next_sequence_ = 0;
 }
 

@@ -185,6 +185,31 @@ bool AutomapStore::save_block(network::State6NativeMapCacheBlock& block) {
     return output.good();
 }
 
+std::optional<std::vector<network::State6PathSearchCell>>
+AutomapStore::path_search_grid(network::State6PlayerPosition origin) {
+    constexpr std::int64_t radius = 110;
+    if (origin.z > 15) return std::nullopt;
+    const auto minimum_x = std::max<std::int64_t>(0,
+        static_cast<std::int64_t>(origin.x) - radius);
+    const auto minimum_y = std::max<std::int64_t>(0,
+        static_cast<std::int64_t>(origin.y) - radius);
+    const auto maximum_x = static_cast<std::int64_t>(origin.x) + radius;
+    const auto maximum_y = static_cast<std::int64_t>(origin.y) + radius;
+
+    std::vector<network::State6NativeMapCacheBlock> blocks;
+    for (auto block_y = static_cast<std::uint32_t>(minimum_y) >> 8;
+         block_y <= static_cast<std::uint32_t>(maximum_y) >> 8; ++block_y) {
+        for (auto block_x = static_cast<std::uint32_t>(minimum_x) >> 8;
+             block_x <= static_cast<std::uint32_t>(maximum_x) >> 8; ++block_x) {
+            const auto* block = load_block(block_x, block_y,
+                static_cast<std::uint8_t>(origin.z));
+            if (block == nullptr) return std::nullopt;
+            blocks.push_back(*block);
+        }
+    }
+    return network::make_state6_path_search_grid(origin, blocks);
+}
+
 std::optional<AutomapView> AutomapStore::update(const DecodedMap& map,
     const resources::TibiaDatFile& dat, std::uint16_t player_x,
     std::uint16_t player_y, std::uint8_t player_floor,
@@ -207,11 +232,31 @@ std::optional<AutomapView> AutomapStore::update(const DecodedMap& map,
         auto* block = load_block(block_x, block_y, tile.floor);
         const auto offset = static_cast<std::size_t>(tile.y & 0xffU) * 256U +
             static_cast<std::size_t>(tile.x & 0xffU);
-        if (block->map_values[offset] != color) {
-            block->map_values[offset] = color;
-            const auto found = blocks_.find(block_key(block_x, block_y, tile.floor));
-            if (found != blocks_.end()) found->second.dirty = true;
+        std::uint8_t path_value = 0xfa;
+        bool blocked = ordered->empty();
+        for (const auto* object : *ordered) {
+            if (object->type == 0x63 && object->creature_id != 0) {
+                blocked = true;
+                continue;
+            }
+            if (object->type == 0 || object->creature_id != 0) continue;
+            const auto* item = dat.find_item(object->type);
+            if (item == nullptr) continue;
+            if (item->has_native_property(0x10) ||
+                item->has_native_property(0x0d))
+                blocked = true;
+            if (!item->has_native_property(0x00)) continue;
+            const auto* ground = item->find_attribute(0x00);
+            if (ground == nullptr || ground->payload_words.empty()) continue;
+            path_value = static_cast<std::uint8_t>(std::min<std::uint16_t>(
+                path_value, ground->payload_words.front()));
         }
+        if (blocked) path_value = 0xff;
+
+        block->map_values[offset] = color;
+        block->path_values[offset] = path_value;
+        const auto found = blocks_.find(block_key(block_x, block_y, tile.floor));
+        if (found != blocks_.end()) found->second.dirty = true;
     }
 
     if (state.floor >= 16 || state.zoom < 1) return std::nullopt;

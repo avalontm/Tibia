@@ -244,9 +244,24 @@ MapWindowTileSurfaceDrawStats MapWindowTileSurfaceRenderer::draw(
             draw_visit(frame.visits[index]);
 
         if (!primary_visit.visit.neighboring_object_pass) {
-            if (during_tile_pass)
+            if (during_tile_pass) {
+                const auto tile = std::find_if(frame.visible_tiles.begin(),
+                    frame.visible_tiles.end(), [&primary_visit](const auto& candidate) {
+                        return candidate.local_x == primary_visit.visit.local_x &&
+                            candidate.local_y == primary_visit.visit.local_y;
+                    });
+                const auto cell = cell_index(primary_visit.visit.local_x,
+                    primary_visit.visit.local_y, frame);
+                if (tile != frame.visible_tiles.end() &&
+                    tile->batch.status == map::TileRenderStatus::queued &&
+                    !submitted[cell]) {
+                    flush_cell(primary_visit.visit.local_x,
+                        primary_visit.visit.local_y, tile->batch.update.screen_x,
+                        tile->batch.update.screen_y);
+                }
                 during_tile_pass(floor, primary_visit.visit.local_x,
                     primary_visit.visit.local_y);
+            }
             if (after_tile)
                 tile_overlays.push_back({floor, primary_visit.visit.local_x,
                     primary_visit.visit.local_y});
@@ -258,8 +273,13 @@ MapWindowTileSurfaceDrawStats MapWindowTileSurfaceRenderer::draw(
         for (std::int32_t floor = 0; floor <= frame.highest_active_floor; ++floor) {
             for (const auto& tile : frame.visible_tiles) {
                 if (tile.batch.status != map::TileRenderStatus::queued) continue;
-                if (during_tile_pass)
+                const auto cell = cell_index(tile.local_x, tile.local_y, frame);
+                if (during_tile_pass) {
+                    if (!submitted[cell])
+                        flush_cell(tile.local_x, tile.local_y,
+                            tile.batch.update.screen_x, tile.batch.update.screen_y);
                     during_tile_pass(floor, tile.local_x, tile.local_y);
+                }
                 if (after_tile)
                     tile_overlays.push_back({floor, tile.local_x, tile.local_y});
             }

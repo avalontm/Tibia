@@ -66,6 +66,8 @@ public:
         const DecodedMap& map, const resources::TibiaDatFile& dat,
         std::uint16_t player_x, std::uint16_t player_y, std::uint8_t player_floor,
         const AutomapViewState& state);
+    [[nodiscard]] std::optional<std::vector<network::State6PathSearchCell>>
+    path_search_grid(network::State6PlayerPosition origin);
 
 private:
     [[nodiscard]] network::State6NativeMapCacheBlock* load_block(

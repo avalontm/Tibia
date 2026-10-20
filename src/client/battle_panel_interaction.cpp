@@ -5,6 +5,37 @@
 
 namespace tibia::client {
 
+std::vector<BattleContextMenuOption> battle_party_context_options(
+    std::uint8_t local_party_flag,
+    std::uint8_t target_party_flag,
+    std::wstring_view player_name) {
+    switch (local_party_flag) {
+    case 0:
+    case 2:
+        if (target_party_flag == 1)
+            return {{BattleTargetAction::join_party,
+                L"Join " + std::wstring(player_name) + L"'s Party"}};
+        return {{BattleTargetAction::invite_party, L"Invite to Party"}};
+    case 1:
+        if (target_party_flag == 2)
+            return {{BattleTargetAction::revoke_party_invitation,
+                L"Revoke " + std::wstring(player_name) + L"'s Invitation"}};
+        return {};
+    case 3:
+        return {};
+    case 4:
+        if (target_party_flag == 2)
+            return {{BattleTargetAction::revoke_party_invitation,
+                L"Revoke " + std::wstring(player_name) + L"'s Invitation"}};
+        if (target_party_flag == 3)
+            return {{BattleTargetAction::pass_party_leadership,
+                L"Pass Leadership to " + std::wstring(player_name)}};
+        return {{BattleTargetAction::invite_party, L"Invite to Party"}};
+    default:
+        return {};
+    }
+}
+
 std::uint32_t battle_panel_creature_at(
     const BattlePanelLayout& layout,
     std::span<const BattleCreatureRow> rows,
@@ -29,7 +60,8 @@ BattleContextMenuPlan make_battle_context_menu_plan(
     int anchor_x,
     int anchor_y,
     int client_width,
-    int client_height) {
+    int client_height,
+    bool include_rule_violation) {
     const auto attack_action = targets.attack_target == creature_id
         ? BattleTargetAction::stop_attack : BattleTargetAction::attack;
     const auto follow_action = targets.follow_target == creature_id
@@ -46,7 +78,8 @@ BattleContextMenuPlan make_battle_context_menu_plan(
             battle_context_menu_action_width_padding);
     width += battle_context_menu_border * 2;
     const auto has_player_options = !player_options.empty();
-    const auto item_count = 3U + static_cast<unsigned>(player_options.size());
+    const auto item_count = 3U + static_cast<unsigned>(player_options.size()) +
+        static_cast<unsigned>(include_rule_violation);
     const auto separator_count = 1U + static_cast<unsigned>(has_player_options);
     const auto height = battle_context_menu_border * 2 +
         row_height * static_cast<int>(item_count) +
@@ -98,6 +131,13 @@ BattleContextMenuPlan make_battle_context_menu_plan(
     plan.entries.push_back({BattleTargetAction::copy_name, L"Copy Name",
         {x + battle_context_menu_border, row_y,
             width - battle_context_menu_border * 2, row_height}, false});
+    if (include_rule_violation) {
+        row_y += row_height;
+        plan.entries.push_back({BattleTargetAction::rule_violation,
+            L"Rule Violation",
+            {x + battle_context_menu_border, row_y,
+                width - battle_context_menu_border * 2, row_height}, false});
+    }
     return plan;
 }
 
@@ -126,6 +166,7 @@ bool apply_battle_target_action(
     case BattleTargetAction::message_to:
     case BattleTargetAction::add_vip:
     case BattleTargetAction::toggle_ignore:
+    case BattleTargetAction::rule_violation:
         return false;
     }
     return false;
