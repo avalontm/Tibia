@@ -19,6 +19,7 @@
 
 # Local reverse-engineering tools and visual captures
 /.tools/
+/docs/
 *.log
 *.tmp
 *.bak

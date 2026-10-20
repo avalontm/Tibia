@@ -1,36 +1,38 @@
-# Tibia 7.92 — reconstrucción en C++
+# Tibia 7.92 Client Reconstruction
 
-Reconstrucción de código abierto de la funcionalidad del cliente Windows de Tibia 7.92, desarrollada mediante ingeniería inversa del ejecutable original. El objetivo es reproducir su comportamiento real a partir de evidencia del cliente; no es una conversión automática del binario ni contiene el código fuente original.
+An open C++ reconstruction of the Windows Tibia 7.92 client, built through reverse engineering of the original executable. The goal is to reproduce the original client's real behavior from observed evidence. This is not an automatic binary-to-source conversion and does not contain the original source code.
 
-## Ficha técnica
+## Technical Overview
 
-- **Cliente de referencia:** Tibia Windows Client 7.92, PE32 x86.
-- **Lenguaje:** C++20.
-- **Plataforma:** Windows.
-- **Build:** CMake y MSVC.
-- **Autor:** AvalonTM.
-- **Estado:** reconstrucción activa; algunas funciones y diferencias respecto al original siguen pendientes de análisis e implementación.
+- **Reference client:** Tibia Windows Client 7.92, PE32 x86.
+- **Language:** C++20.
+- **Platform:** Windows.
+- **Build system:** CMake and MSVC.
+- **Author:** AvalonTM.
+- **Status:** In active development. Some behavior and subsystems remain under investigation and implementation.
 
-## Funcionalidad implementada
+## Implemented Features
 
-- Lectura de recursos `.dat`, `.spr` y `.pic`, decodificación de sprites y composición de objetos.
-- Renderizadores para DirectDraw, OpenGL y Direct3D 9.
-- Interfaz del cliente: login, diálogos y opciones, y pantallas del juego con mapa, panel lateral, minimapa, contenedores y consola.
-- Componentes de protocolo de red, login, cifrado XTEA/RSA, lectura de paquetes y comunicación con el servidor.
-- Reconstrucción modular en `src/` e interfaces públicas en `include/`.
+- Readers for `.dat`, `.spr`, and `.pic` resources, sprite decoding, and object composition.
+- Rendering backends for DirectDraw, OpenGL, and Direct3D 9.
+- Client interface reconstruction, including login, dialogs, options, and game-screen UI such as the map view, sidebar, automap, containers, and chat console.
+- Network and login components, including XTEA/RSA routines, packet readers, and server communication.
+- Modular C++ code organized under `src/` and public interfaces under `include/`.
 
-La cobertura y el grado de equivalencia varían por módulo. La meta es una reconstrucción 1:1 verificada; este repositorio no afirma que el cliente completo ya esté terminado.
+Coverage varies by subsystem. The target is a verified 1:1 reconstruction; the complete client is not yet finished.
 
-## Compilación
+## Build
 
-Se requiere Visual Studio o Build Tools con MSVC x86/x64, CMake y PowerShell. Desde la raíz del repositorio:
+Requirements: Visual Studio or Build Tools with MSVC, CMake, and PowerShell.
+
+From the repository root, run:
 
 ```powershell
 .\scripts\build.ps1 -Action Build -Configuration Release
 ```
 
-El build espera los recursos originales `Tibia.dat`, `Tibia.pic`, `Tibia.spr` y `Tibia.cfg` en la raíz. Por derechos de autor, esos archivos y `Tibia.exe` no se distribuyen en este repositorio.
+The build expects the original `Tibia.dat`, `Tibia.pic`, `Tibia.spr`, and `Tibia.cfg` files in the repository root. These files and `Tibia.exe` are not distributed here.
 
-## Ingeniería inversa y contribuciones
+## Contributing
 
-Las reglas de reconstrucción están en [`docs/decompilation-rules.md`](docs/decompilation-rules.md). La documentación técnica de cada subsistema está en [`docs/`](docs/). Los cambios deben basarse en el comportamiento observado del cliente original y dejar claro qué está confirmado y qué sigue sin resolver.
+Contributions should be based on behavior verified against the original client. Keep confirmed observations separate from unresolved behavior, and organize implementation by module.
