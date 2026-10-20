@@ -27,6 +27,7 @@ The goal is a modular, evidence-based 1:1 reconstruction. The project is still i
 | Login and dialogs | Reconstructed login flow, account fields, status/message windows, options, and supporting dialogs. | Partial; fidelity work continues |
 | Game interface | Game-screen map frame, sidebar, status bars, equipment area, automap controls, content panels, and chat console. | Partial; interaction and layout details remain under reconstruction |
 | Map pipeline | Map model, viewport/floor handling, tile ordering, render queues, lighting, effects, creatures, and automap storage. | Partial; server-fed world behavior is still being completed |
+| Automap `.map` files | Loads and saves explored map blocks using coordinate-based `.map` filenames under `%APPDATA%\Tibia\Automap`, outside the executable directory. | Implemented; cache details continue to be verified |
 | Network protocol | Packet readers/writers, framed TCP streams, login request construction, response handling, and state/opcode dispatch. | Partial; some fields and routes remain unresolved |
 | Cryptography | XTEA frame encryption and RSA login-block/public-key operations reconstructed as separate modules. | Implemented; full live-client equivalence is not claimed |
 | Windows client host | Native Win32 application with renderer selection, window resizing, input handling, and game-client integration. | Implemented; end-to-end behavior is still under development |
@@ -75,6 +76,8 @@ The client build expects these original files in the repository root. The asset 
 | `Tibia.spr` | Sprite image data |
 | `Tibia.pic` | UI picture and skin data |
 | `Tibia.cfg` | Original client configuration |
+
+Explored minimap blocks are stored separately as `.map` files under `%APPDATA%\Tibia\Automap`. They are runtime cache data and are not part of the repository.
 
 These files and `Tibia.exe` are excluded from this repository and must be obtained separately from a legally held Tibia 7.92 installation. Local copies are ignored by Git.
 
