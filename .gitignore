@@ -1,0 +1,35 @@
+# Builds and compiler output
+/build*/
+/.vs/
+/.idea/
+*.obj
+*.o
+*.pch
+*.pdb
+*.ilk
+*.idb
+*.ipch
+*.lib
+*.exp
+*.dll
+*.exe
+*.suo
+*.user
+*.tlog/
+
+# Local reverse-engineering tools and visual captures
+/.tools/
+*.log
+*.tmp
+*.bak
+*.cache
+
+# Original Tibia client and proprietary game resources
+/Tibia.exe
+/Tibia.dat
+/Tibia.pic
+/Tibia.spr
+/Tibia.res
+/Tibia.cfg
+/*.map
+/*.otmm
